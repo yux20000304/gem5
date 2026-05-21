@@ -203,6 +203,7 @@ class System : public SimObject, public PCEventScope
         };
 
         ThreadContext *findFree();
+        ThreadContext *findFree(uint32_t socket_id);
 
         ThreadContext *
         operator [](ContextID id) const

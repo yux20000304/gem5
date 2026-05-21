@@ -73,6 +73,20 @@ namespace gem5
 namespace
 {
 
+int
+memoryPoolIdForProcess(Process *process)
+{
+    fatal_if(process->contextIds.empty(),
+             "Process %s is not associated with any HW contexts!\n",
+             process->name());
+    return process->system->threads[process->contextIds.front()]->socketId();
+}
+
+} // anonymous namespace
+
+namespace
+{
+
 typedef std::vector<Process::Loader *> LoaderList;
 
 LoaderList &
@@ -337,7 +351,8 @@ Process::allocateMem(Addr vaddr, int64_t size, bool clobber)
     }
 
     const int npages = divCeil(size, page_size);
-    const Addr paddr = seWorkload->allocPhysPages(npages);
+    const Addr paddr = seWorkload->allocPhysPages(
+            npages, memoryPoolIdForProcess(this));
     const Addr pages_size = npages * page_size;
     pTable->map(page_addr, paddr, pages_size,
                 clobber ? EmulationPageTable::Clobber :
@@ -367,17 +382,35 @@ Process::deallocateMem(Addr vaddr, int64_t size)
                 // achieve the same result, but would be more expensive
                 // because it would unnecessarily zero out pages that
                 // were allocated for the first time.
+                ThreadContext *proxy_tc = nullptr;
+                for (auto cid : contextIds) {
+                    ThreadContext *candidate = system->threads[cid];
+                    if (candidate->getProcessPtr() != this)
+                        continue;
+
+                    proxy_tc = candidate;
+                    if (candidate->status() != ThreadContext::Halted)
+                        break;
+                }
+                fatal_if(!proxy_tc,
+                         "Process %s has no thread context for deallocation",
+                         name());
+
                 SETranslatingPortProxy virt_mem(
-                    system->threads[0], SETranslatingPortProxy::Always);
+                    proxy_tc, SETranslatingPortProxy::Always);
                 const std::vector<uint8_t> zero_page(page_size, 0);
                 virt_mem.writeBlob(page_vaddr, zero_page.data(), page_size);
             }
 
             // Unmap the virtual page.
             pTable->unmap(page_vaddr, page_size);
+            panic_if(pTable->lookup(page_vaddr) != nullptr,
+                     "Process %s (pid %d) failed to unmap VA %#x",
+                     progName(), pid(), page_vaddr);
 
             // Deallocate the physical page.
-            seWorkload->deallocPhysPage(page_paddr);
+            seWorkload->deallocPhysPage(
+                    page_paddr, memoryPoolIdForProcess(this));
         }
     }
 }
@@ -387,7 +420,8 @@ Process::replicatePage(Addr vaddr, Addr new_paddr, ThreadContext *old_tc,
                        ThreadContext *new_tc, bool allocate_page)
 {
     if (allocate_page)
-        new_paddr = seWorkload->allocPhysPages(1);
+        new_paddr = seWorkload->allocPhysPages(
+                1, memoryPoolIdForProcess(this));
 
     // Read from old physical page.
     const size_t buf_size = pTable->pageSize();

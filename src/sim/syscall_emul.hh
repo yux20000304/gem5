@@ -1771,7 +1771,7 @@ doClone(SyscallDesc *desc, ThreadContext *tc, RegVal flags, RegVal newStack,
         return -EINVAL;
 
     ThreadContext *ctc;
-    if (!(ctc = tc->getSystemPtr()->threads.findFree())) {
+    if (!(ctc = tc->getSystemPtr()->threads.findFree(tc->socketId()))) {
         DPRINTF_SYSCALL(Verbose, "clone: no spare thread context in system"
                         "[cpu %d, thread %d]", tc->cpuId(), tc->threadId());
         return -EAGAIN;
@@ -3058,17 +3058,33 @@ schedGetaffinityFunc(SyscallDesc *desc, ThreadContext *tc,
                      VPtr<> cpu_set_mask)
 {
 #if defined(__linux__)
-    if (cpusetsize < CPU_ALLOC_SIZE(tc->getSystemPtr()->threads.size()))
+    auto *system = tc->getSystemPtr();
+    int visible_cpus = 0;
+    for (int i = 0; i < system->threads.size(); i++) {
+        if (system->threads[i]->socketId() == tc->socketId()) {
+            visible_cpus++;
+        }
+    }
+
+    if (cpusetsize < CPU_ALLOC_SIZE(visible_cpus))
         return -EINVAL;
 
     SETranslatingPortProxy proxy(tc);
     BufferArg maskBuf(cpu_set_mask, cpusetsize);
     maskBuf.copyIn(proxy);
-    for (int i = 0; i < tc->getSystemPtr()->threads.size(); i++) {
-        CPU_SET(i, (cpu_set_t *)maskBuf.bufferPtr());
+
+    CPU_ZERO_S(cpusetsize, (cpu_set_t *)maskBuf.bufferPtr());
+
+    int local_cpu = 0;
+    for (int i = 0; i < system->threads.size(); i++) {
+        if (system->threads[i]->socketId() == tc->socketId()) {
+            CPU_SET_S(local_cpu, cpusetsize, (cpu_set_t *)maskBuf.bufferPtr());
+            local_cpu++;
+        }
     }
+
     maskBuf.copyOut(proxy);
-    return CPU_ALLOC_SIZE(tc->getSystemPtr()->threads.size());
+    return CPU_ALLOC_SIZE(visible_cpus);
 #else
     warnUnsupportedOS("sched_getaffinity");
     return -1;

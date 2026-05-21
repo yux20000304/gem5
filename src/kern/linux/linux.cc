@@ -115,7 +115,14 @@ Linux::procSelfMaps(Process *process, ThreadContext *tc)
 std::string
 Linux::cpuOnline(Process *process, ThreadContext *tc)
 {
-    return csprintf("0-%d\n", tc->getSystemPtr()->threads.size() - 1);
+    int online = 0;
+    for (auto *thread: process->system->threads) {
+        if (thread->socketId() == tc->socketId()) {
+            online++;
+        }
+    }
+
+    return csprintf("0-%d\n", online - 1);
 }
 
 std::string

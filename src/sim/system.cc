@@ -127,6 +127,18 @@ System::Threads::findFree()
     return nullptr;
 }
 
+ThreadContext *
+System::Threads::findFree(uint32_t socket_id)
+{
+    for (auto &thread: threads) {
+        if (thread.context->status() == ThreadContext::Halted &&
+            thread.context->socketId() == socket_id) {
+            return thread.context;
+        }
+    }
+    return nullptr;
+}
+
 int
 System::Threads::numRunning() const
 {

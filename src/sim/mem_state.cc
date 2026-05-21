@@ -95,8 +95,15 @@ MemState::isUnmapped(Addr start_addr, Addr length)
     for (auto start = start_addr; start < end_addr;
          start += _pageBytes) {
         if (_ownerProcess->pTable->lookup(start) != nullptr) {
-            panic("Someone allocated physical memory at VA %p without "
-                  "creating a VMA!\n", start);
+            uint32_t socket_id = 0;
+            if (!_ownerProcess->contextIds.empty()) {
+                socket_id = _ownerProcess->system->threads[
+                        _ownerProcess->contextIds.front()]->socketId();
+            }
+            panic("Process %s (pid %d, socket %u) allocated physical memory "
+                  "at VA %p without creating a VMA!\n",
+                  _ownerProcess->progName(), _ownerProcess->pid(),
+                  socket_id, start);
             return false;
         }
     }
