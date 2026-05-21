@@ -57,6 +57,11 @@ class Process(SimObject):
         "ensure all allocated pages are zero-filled. glibc malloc generally "
         "requires this. Disable at your own risk.",
     )
+    crossHostThreads = Param.Bool(
+        False,
+        "allow this SE process to create threads on any host/socket in the "
+        "system instead of only on the current socket",
+    )
 
     uid = Param.Int(100, "user id")
     euid = Param.Int(100, "effective user id")

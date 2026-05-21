@@ -192,6 +192,11 @@ class Process : public SimObject
      */
     bool zeroPages;
 
+    /**
+     * Allow SE threads from this process to run across socket/host domains.
+     */
+    bool crossHostThreads;
+
     EmulationPageTable *pTable;
 
     // Memory proxy for initial image load.

@@ -205,6 +205,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--mode",
+    choices=["per-host-process", "cross-host-threaded"],
+    default="per-host-process",
+    help=(
+        "per-host-process runs one SE process per host. cross-host-threaded "
+        "runs one SE process whose threads may execute on cores from all hosts."
+    ),
+)
+parser.add_argument(
     "--cpu",
     choices=CPU_TYPES,
     default="timing",
@@ -253,13 +262,16 @@ if any(count <= 0 for count in host_core_counts):
 
 num_hosts = len(host_core_counts)
 total_cores = sum(host_core_counts)
-commands = parse_commands(args.cmd, num_hosts, "--cmd")
+num_processes = 1 if args.mode == "cross-host-threaded" else num_hosts
+commands = parse_commands(args.cmd, num_processes, "--cmd")
 
-cwd_list = expand_semicolon_field(args.cwd, num_hosts, "--cwd", os.getcwd())
-stdin_list = expand_semicolon_field(args.stdin, num_hosts, "--stdin")
-stdout_list = expand_semicolon_field(args.stdout, num_hosts, "--stdout")
-stderr_list = expand_semicolon_field(args.stderr, num_hosts, "--stderr")
-env_list = expand_semicolon_field(args.env_file, num_hosts, "--env-file")
+cwd_list = expand_semicolon_field(
+    args.cwd, num_processes, "--cwd", os.getcwd()
+)
+stdin_list = expand_semicolon_field(args.stdin, num_processes, "--stdin")
+stdout_list = expand_semicolon_field(args.stdout, num_processes, "--stdout")
+stderr_list = expand_semicolon_field(args.stderr, num_processes, "--stderr")
+env_list = expand_semicolon_field(args.env_file, num_processes, "--env-file")
 llc_sizes = expand_list(
     parse_csv_list(args.llc_size, "--llc-size"), num_hosts, "--llc-size"
 )
@@ -278,18 +290,21 @@ for cwd in cwd_list:
         raise FileNotFoundError(f"Working directory not found: {cwd}")
 
 processes = []
-for host_id in range(num_hosts):
+for process_id in range(num_processes):
     processes.append(
         make_process(
-            host_id=host_id,
-            command=commands[host_id],
-            cwd=os.path.abspath(cwd_list[host_id]),
-            env_file=env_list[host_id],
-            stdin_path=stdin_list[host_id],
-            stdout_path=stdout_list[host_id],
-            stderr_path=stderr_list[host_id],
+            host_id=process_id,
+            command=commands[process_id],
+            cwd=os.path.abspath(cwd_list[process_id]),
+            env_file=env_list[process_id],
+            stdin_path=stdin_list[process_id],
+            stdout_path=stdout_list[process_id],
+            stderr_path=stderr_list[process_id],
         )
     )
+
+if args.mode == "cross-host-threaded":
+    processes[0].crossHostThreads = True
 
 cpu_cls = CPU_TYPES[args.cpu]
 
@@ -352,7 +367,11 @@ for host_id, core_count in enumerate(host_core_counts):
             system.membus.cpu_side_ports,
             system.membus.mem_side_ports,
         )
-        cpu.workload = processes[host_id]
+        cpu.workload = (
+            processes[0]
+            if args.mode == "cross-host-threaded"
+            else processes[host_id]
+        )
         cpu.createThreads()
         core_index += 1
 
@@ -373,6 +392,7 @@ root = Root(full_system=False, system=system)
 m5.instantiate()
 
 print("Pseudo multi-host SE topology")
+print(f"  mode: {args.mode}")
 print(f"  hosts: {num_hosts}")
 print(f"  total cores: {total_cores}")
 for host_id, core_count in enumerate(host_core_counts):
@@ -384,7 +404,8 @@ for host_id, core_count in enumerate(host_core_counts):
     print(
         f"  host{host_id}: cores={host_core_ids}, llc={llc_sizes[host_id]}, "
         f"mem={host_mem_sizes[host_id]}, range={host_mem_ranges[host_id]}, "
-        f"workload={processes[host_id].cmd}"
+        f"workload="
+        f"{processes[0].cmd if args.mode == 'cross-host-threaded' else processes[host_id].cmd}"
     )
 
 exit_event = m5.simulate()

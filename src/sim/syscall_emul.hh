@@ -1770,8 +1770,10 @@ doClone(SyscallDesc *desc, ThreadContext *tc, RegVal flags, RegVal newStack,
         ((flags & OS::TGT_CLONE_VM)     && !(newStack)))
         return -EINVAL;
 
-    ThreadContext *ctc;
-    if (!(ctc = tc->getSystemPtr()->threads.findFree(tc->socketId()))) {
+    ThreadContext *ctc = p->crossHostThreads ?
+        tc->getSystemPtr()->threads.findFree() :
+        tc->getSystemPtr()->threads.findFree(tc->socketId());
+    if (!ctc) {
         DPRINTF_SYSCALL(Verbose, "clone: no spare thread context in system"
                         "[cpu %d, thread %d]", tc->cpuId(), tc->threadId());
         return -EAGAIN;
@@ -1796,6 +1798,7 @@ doClone(SyscallDesc *desc, ThreadContext *tc, RegVal flags, RegVal newStack,
     pp->gid = p->gid();
     pp->egid = p->egid();
     pp->release = p->release;
+    pp->crossHostThreads = p->crossHostThreads;
 
     /* Find the first free PID that's less than the maximum */
     std::set<int> const& pids = p->system->PIDs;
@@ -3059,6 +3062,23 @@ schedGetaffinityFunc(SyscallDesc *desc, ThreadContext *tc,
 {
 #if defined(__linux__)
     auto *system = tc->getSystemPtr();
+    if (tc->getProcessPtr()->crossHostThreads) {
+        if (cpusetsize < CPU_ALLOC_SIZE(system->threads.size()))
+            return -EINVAL;
+
+        SETranslatingPortProxy proxy(tc);
+        BufferArg maskBuf(cpu_set_mask, cpusetsize);
+        maskBuf.copyIn(proxy);
+        CPU_ZERO_S(cpusetsize, (cpu_set_t *)maskBuf.bufferPtr());
+
+        for (int i = 0; i < system->threads.size(); i++) {
+            CPU_SET_S(i, cpusetsize, (cpu_set_t *)maskBuf.bufferPtr());
+        }
+
+        maskBuf.copyOut(proxy);
+        return CPU_ALLOC_SIZE(system->threads.size());
+    }
+
     int visible_cpus = 0;
     for (int i = 0; i < system->threads.size(); i++) {
         if (system->threads[i]->socketId() == tc->socketId()) {
