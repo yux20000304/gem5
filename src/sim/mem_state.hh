@@ -129,7 +129,7 @@ class MemState : public Serializable
      */
     void mapRegion(Addr start_addr, Addr length,
                    const std::string& name="anon", int sim_fd=-1,
-                   Addr offset=0);
+                   Addr offset=0, int memory_pool_id=-1);
 
     /**
      * Unmap a pre-existing region. Depending on the range being unmapped
@@ -202,6 +202,7 @@ class MemState : public Serializable
         for (auto vma : _vmaList) {
             ScopedCheckpointSection sec(cp, csprintf("Vma%d", count++));
             paramOut(cp, "name", vma.getName());
+            paramOut(cp, "memoryPoolId", vma.memoryPoolId());
             if (vma.hasHostBuf()) {
                 paramOut(cp, "fileOffset", vma.getFileMappingOffset());
             }
@@ -231,7 +232,9 @@ class MemState : public Serializable
             Addr end;
             off_t offset = 0;
             int host_fd = -1;
+            int memory_pool_id = -1;
             paramIn(cp, "name", name);
+            optParamIn(cp, "memoryPoolId", memory_pool_id, false);
             if (optParamIn(cp, "fileOffset", offset, false)) {
                 host_fd = open(name.c_str(), O_RDONLY);
                 fatal_if(host_fd < 0,
@@ -241,7 +244,7 @@ class MemState : public Serializable
             paramIn(cp, "addrRangeStart", start);
             paramIn(cp, "addrRangeEnd", end);
             _vmaList.emplace_back(AddrRange(start, end), _pageBytes, name,
-                                  host_fd, offset);
+                                  host_fd, offset, memory_pool_id);
             close(host_fd);
         }
     }

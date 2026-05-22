@@ -46,8 +46,9 @@ class VMA
 
   public:
     VMA(AddrRange r, Addr page_bytes, const std::string& vma_name="anon",
-        int fd=-1, off_t off=0)
-        : _addrRange(r), _pageBytes(page_bytes), _vmaName(vma_name)
+        int fd=-1, off_t off=0, int memory_pool_id=-1)
+        : _addrRange(r), _pageBytes(page_bytes),
+          _memoryPoolId(memory_pool_id), _vmaName(vma_name)
     {
         DPRINTF(Vma, "Creating vma start %#x len %llu end %#x\n",
                 r.start(), r.size(), r.end());
@@ -110,6 +111,8 @@ class VMA
         return hasHostBuf() ? _origHostBuf->getOffset() : 0;
     }
 
+    int memoryPoolId() const { return _memoryPoolId; }
+
     /**
      * Defer AddrRange related calls to the AddrRange.
      */
@@ -153,6 +156,12 @@ class VMA
      * Number of bytes in an OS page.
      */
     Addr _pageBytes;
+
+    /**
+     * Physical memory pool used by this VMA. A negative value means use the
+     * owning process' default pool.
+     */
+    int _memoryPoolId;
 
     /**
      * The host file backing will be chopped up and reassigned as pages are

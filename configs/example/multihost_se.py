@@ -8,12 +8,14 @@ from m5.objects import (
     X86O3CPU,
     AddrRange,
     Cache,
+    CxlMemoryDriver,
     DDR3_1600_8x8,
     L2XBar,
     MemCtrl,
     Process,
     Root,
     SEWorkload,
+    SimpleMemDelay,
     SimpleMemory,
     SrcClockDomain,
     System,
@@ -253,6 +255,32 @@ parser.add_argument(
     default="2MiB",
     help="Comma-separated per-host LLC sizes or a single size for all hosts.",
 )
+parser.add_argument(
+    "--cxl-mem-size",
+    default="0B",
+    help=(
+        "Size of one shared CXL memory range appended after all host private "
+        "memory. Set to 0B to disable /dev/gem5_cxl_mem."
+    ),
+)
+parser.add_argument(
+    "--cxl-latency",
+    default="150ns",
+    help="SimpleMemory access latency for the shared CXL memory range.",
+)
+parser.add_argument(
+    "--cxl-bandwidth",
+    default="32GiB/s",
+    help="SimpleMemory bandwidth for the shared CXL memory range.",
+)
+parser.add_argument(
+    "--cxl-link-delay",
+    default="0ns",
+    help=(
+        "Per-direction request/response delay inserted between the coherent "
+        "membus and shared CXL memory."
+    ),
+)
 
 args = parser.parse_args()
 
@@ -284,6 +312,7 @@ host_mem_sizes = expand_list(
     "--host-mem-size" if args.host_mem_size else "--mem-size",
 )
 host_mem_sizes = [toMemorySize(size) for size in host_mem_sizes]
+cxl_mem_size = toMemorySize(args.cxl_mem_size)
 
 for cwd in cwd_list:
     if cwd and not os.path.isdir(cwd):
@@ -343,6 +372,21 @@ for host_mem_size in host_mem_sizes:
     system.mem_ranges.append(host_range)
     host_mem_base += host_mem_size
 
+cxl_range = None
+cxl_pool_id = None
+if cxl_mem_size > 0:
+    cxl_pool_id = len(host_mem_ranges)
+    cxl_range = AddrRange(host_mem_base, size=cxl_mem_size)
+    system.mem_ranges.append(cxl_range)
+    host_mem_base += cxl_mem_size
+
+    system.cxl_mem_driver = CxlMemoryDriver(
+        filename="gem5_cxl_mem",
+        memory_pool_id=cxl_pool_id,
+    )
+    for process in processes:
+        process.drivers = [system.cxl_mem_driver]
+
 core_index = 0
 for host_id, core_count in enumerate(host_core_counts):
     host_bus = L2XBar()
@@ -388,6 +432,22 @@ for host_id, host_range in enumerate(host_mem_ranges):
 
     setattr(system, f"host{host_id}_mem_ctrl", mem_ctrl)
 
+if cxl_range is not None:
+    system.cxl_mem_ctrl = FastSimpleMemory(
+        latency=args.cxl_latency,
+        bandwidth=args.cxl_bandwidth,
+    )
+    system.cxl_mem_ctrl.range = cxl_range
+
+    system.cxl_link = SimpleMemDelay(
+        read_req=args.cxl_link_delay,
+        read_resp=args.cxl_link_delay,
+        write_req=args.cxl_link_delay,
+        write_resp=args.cxl_link_delay,
+    )
+    system.cxl_link.cpu_side_port = system.membus.mem_side_ports
+    system.cxl_link.mem_side_port = system.cxl_mem_ctrl.port
+
 root = Root(full_system=False, system=system)
 m5.instantiate()
 
@@ -407,6 +467,14 @@ for host_id, core_count in enumerate(host_core_counts):
         f"workload="
         f"{processes[0].cmd if args.mode == 'cross-host-threaded' else processes[host_id].cmd}"
     )
+if cxl_range is not None:
+    print(
+        f"  cxl: pool={cxl_pool_id}, mem={cxl_mem_size}, range={cxl_range}, "
+        f"latency={args.cxl_latency}, bandwidth={args.cxl_bandwidth}, "
+        f"link_delay={args.cxl_link_delay}, device=/dev/gem5_cxl_mem"
+    )
+else:
+    print("  cxl: disabled")
 
 exit_event = m5.simulate()
 print(f"Exit tick: {m5.curTick()}")

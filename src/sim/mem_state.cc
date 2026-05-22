@@ -28,7 +28,10 @@
 
 #include "sim/mem_state.hh"
 
+#include <algorithm>
 #include <cassert>
+#include <tuple>
+#include <vector>
 
 #include "arch/generic/mmu.hh"
 #include "debug/Vma.hh"
@@ -177,7 +180,8 @@ MemState::updateBrkRegion(Addr old_brk, Addr new_brk)
 
 void
 MemState::mapRegion(Addr start_addr, Addr length,
-                    const std::string& region_name, int sim_fd, Addr offset)
+                    const std::string& region_name, int sim_fd, Addr offset,
+                    int memory_pool_id)
 {
     DPRINTF(Vma, "memstate: creating vma (%s) [0x%x - 0x%x]\n",
             region_name.c_str(), start_addr, start_addr + length);
@@ -192,7 +196,8 @@ MemState::mapRegion(Addr start_addr, Addr length,
      * Record the region in our list structure.
      */
     _vmaList.emplace_back(AddrRange(start_addr, start_addr + length),
-                          _pageBytes, region_name, sim_fd, offset);
+                          _pageBytes, region_name, sim_fd, offset,
+                          memory_pool_id);
 }
 
 void
@@ -200,9 +205,18 @@ MemState::unmapRegion(Addr start_addr, Addr length)
 {
     Addr end_addr = start_addr + length;
     const AddrRange range(start_addr, end_addr);
+    std::vector<std::tuple<Addr, Addr, int>> deallocations;
 
     auto vma = std::begin(_vmaList);
     while (vma != std::end(_vmaList)) {
+        if (vma->intersects(range)) {
+            Addr dealloc_start = std::max(start_addr, vma->start());
+            Addr dealloc_end = std::min(end_addr, vma->end());
+            deallocations.emplace_back(dealloc_start,
+                                       dealloc_end - dealloc_start,
+                                       vma->memoryPoolId());
+        }
+
         if (vma->isStrictSuperset(range)) {
             DPRINTF(Vma, "memstate: split vma [0x%x - 0x%x] into "
                     "[0x%x - 0x%x] and [0x%x - 0x%x]\n",
@@ -279,7 +293,15 @@ MemState::unmapRegion(Addr start_addr, Addr length)
     /**
      * Deallocate physical pages mapped to by this virtual address range.
      */
-    _ownerProcess->deallocateMem(start_addr, length);
+    if (deallocations.empty()) {
+        _ownerProcess->deallocateMem(start_addr, length);
+    } else {
+        for (const auto &deallocation : deallocations) {
+            _ownerProcess->deallocateMem(
+                    std::get<0>(deallocation), std::get<1>(deallocation),
+                    std::get<2>(deallocation));
+        }
+    }
 }
 
 void
@@ -400,7 +422,8 @@ MemState::fixupFault(Addr vaddr)
     for (const auto &vma : _vmaList) {
         if (vma.contains(vaddr)) {
             Addr vpage_start = roundDown(vaddr, _pageBytes);
-            _ownerProcess->allocateMem(vpage_start, _pageBytes);
+            _ownerProcess->allocateMem(vpage_start, _pageBytes, false,
+                                       vma.memoryPoolId());
 
             /**
              * We are assuming that fresh pages are zero-filled, so there is

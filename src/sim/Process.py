@@ -90,3 +90,13 @@ class EmulatedDriver(SimObject):
     cxx_class = "gem5::EmulatedDriver"
     abstract = True
     filename = Param.String("device file name (under /dev)")
+
+
+class CxlMemoryDriver(EmulatedDriver):
+    type = "CxlMemoryDriver"
+    cxx_header = "sim/cxl_memory_driver.hh"
+    cxx_class = "gem5::CxlMemoryDriver"
+
+    memory_pool_id = Param.Int(
+        -1, "SE physical memory pool backing /dev/gem5_cxl_mem mappings"
+    )

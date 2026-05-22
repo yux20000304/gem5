@@ -2055,7 +2055,15 @@ mmapFunc(SyscallDesc *desc, ThreadContext *tc,
         return -EINVAL;
     }
 
-    if ((prot & PROT_WRITE) && (tgt_flags & OS::TGT_MAP_SHARED)) {
+    bool emulated_driver_mmap = false;
+    if (!(tgt_flags & OS::TGT_MAP_ANONYMOUS) && tgt_fd >= 0) {
+        std::shared_ptr<FDEntry> fdep = (*p->fds)[tgt_fd];
+        emulated_driver_mmap =
+            std::dynamic_pointer_cast<DeviceFDEntry>(fdep) != nullptr;
+    }
+
+    if ((prot & PROT_WRITE) && (tgt_flags & OS::TGT_MAP_SHARED) &&
+        !emulated_driver_mmap) {
         // With shared mmaps, there are two cases to consider:
         // 1) anonymous: writes should modify the mapping and this should be
         // visible to observers who share the mapping. Currently, it's

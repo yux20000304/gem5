@@ -330,7 +330,8 @@ Process::drain()
 }
 
 void
-Process::allocateMem(Addr vaddr, int64_t size, bool clobber)
+Process::allocateMem(Addr vaddr, int64_t size, bool clobber,
+                     int memory_pool_id)
 {
     const auto page_size = pTable->pageSize();
 
@@ -352,8 +353,10 @@ Process::allocateMem(Addr vaddr, int64_t size, bool clobber)
     }
 
     const int npages = divCeil(size, page_size);
+    const int pool_id = memory_pool_id >= 0 ?
+        memory_pool_id : memoryPoolIdForProcess(this);
     const Addr paddr = seWorkload->allocPhysPages(
-            npages, memoryPoolIdForProcess(this));
+            npages, pool_id);
     const Addr pages_size = npages * page_size;
     pTable->map(page_addr, paddr, pages_size,
                 clobber ? EmulationPageTable::Clobber :
@@ -361,12 +364,14 @@ Process::allocateMem(Addr vaddr, int64_t size, bool clobber)
 }
 
 void
-Process::deallocateMem(Addr vaddr, int64_t size)
+Process::deallocateMem(Addr vaddr, int64_t size, int memory_pool_id)
 {
     const auto page_size = pTable->pageSize();
     const Addr page_vbase = roundDown(vaddr, page_size);
     const Addr page_vend = roundUp(vaddr + size, page_size);
     const int npages = (page_vend - page_vbase) / page_size;
+    const int pool_id = memory_pool_id >= 0 ?
+        memory_pool_id : memoryPoolIdForProcess(this);
 
     // Free any physical pages that were mapped to by this virtual
     // address range.
@@ -410,8 +415,7 @@ Process::deallocateMem(Addr vaddr, int64_t size)
                      progName(), pid(), page_vaddr);
 
             // Deallocate the physical page.
-            seWorkload->deallocPhysPage(
-                    page_paddr, memoryPoolIdForProcess(this));
+            seWorkload->deallocPhysPage(page_paddr, pool_id);
         }
     }
 }

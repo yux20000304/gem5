@@ -117,13 +117,14 @@ class Process : public SimObject
     // align to page boundaries, it will be expanded in either direction until
     // it does. This function will therefore set up *at least* the range
     // requested, and may configure more if necessary.
-    void allocateMem(Addr vaddr, int64_t size, bool clobber=false);
+    void allocateMem(Addr vaddr, int64_t size, bool clobber=false,
+                     int memory_pool_id=-1);
 
     /**
      * Unmap the given virtual address range and deallocate any physical
      * pages that it mapped to.
      */
-    void deallocateMem(Addr vaddr, int64_t size);
+    void deallocateMem(Addr vaddr, int64_t size, int memory_pool_id=-1);
 
     /// Attempt to fix up a fault at vaddr by allocating a page on the stack.
     /// @return Whether the fault has been fixed.
