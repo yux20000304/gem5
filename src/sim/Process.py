@@ -100,3 +100,27 @@ class CxlMemoryDriver(EmulatedDriver):
     memory_pool_id = Param.Int(
         -1, "SE physical memory pool backing /dev/gem5_cxl_mem mappings"
     )
+
+
+class DsmTeeMemoryDriver(EmulatedDriver):
+    type = "DsmTeeMemoryDriver"
+    cxx_header = "sim/dsm_tee_memory_driver.hh"
+    cxx_class = "gem5::DsmTeeMemoryDriver"
+
+    memory_pool_id = Param.Int(
+        -1, "SE physical memory pool backing DSM-TEE CXL regions"
+    )
+    num_vmids = Param.Int(
+        1, "Number of VM identities; core VMID policy maps VMID to cpu_id"
+    )
+    auto_grant_all = Param.Bool(
+        True, "Grant RW permission to all VMIDs for auto-created mmap regions"
+    )
+    auto_create_on_mmap = Param.Bool(
+        True, "Create one DSM-TEE region automatically for offset-zero mmap"
+    )
+    metadata_reserved_size = Param.MemorySize(
+        "4MiB",
+        "CXL memory reserved for DSM-TEE permission table "
+        "and reverse page table",
+    )

@@ -66,6 +66,7 @@ SimObject('XBar.py', sim_objects=[
 SimObject('HMCController.py', sim_objects=['HMCController'])
 SimObject('SerialLink.py', sim_objects=['SerialLink'])
 SimObject('MemDelay.py', sim_objects=['MemDelay', 'SimpleMemDelay'])
+SimObject('DsmTeeController.py', sim_objects=['DsmTeeController'])
 SimObject('PortTerminator.py', sim_objects=['PortTerminator'])
 SimObject('ThreadBridge.py', sim_objects=['ThreadBridge'])
 
@@ -104,6 +105,7 @@ Source('hmc_controller.cc')
 Source('htm.cc')
 Source('serial_link.cc')
 Source('mem_delay.cc')
+Source('dsm_tee_controller.cc')
 Source('port_terminator.cc')
 
 GTest('backdoor_manager.test', 'backdoor_manager.test.cc',

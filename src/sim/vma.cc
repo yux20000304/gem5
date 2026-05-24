@@ -75,9 +75,9 @@ VMA::sliceRegionRight(Addr slice_addr)
 void
 VMA::sliceRegionLeft(Addr slice_addr)
 {
-    if (hasHostBuf()) {
-        auto overlap_len = slice_addr - _addrRange.start();
+    auto overlap_len = slice_addr - _addrRange.start();
 
+    if (hasHostBuf()) {
         if (overlap_len >= _hostBufLen) {
             _hostBufLen = 0;
             _hostBuf = nullptr;
@@ -88,6 +88,9 @@ VMA::sliceRegionLeft(Addr slice_addr)
 
         _hostBuf = (void *)((uint8_t *)_hostBuf + overlap_len);
     }
+
+    if (hasFixedPaddr())
+        _fixedPaddrBase += overlap_len;
 
     _addrRange = AddrRange(slice_addr, _addrRange.end());
 

@@ -10,6 +10,8 @@ from m5.objects import (
     Cache,
     CxlMemoryDriver,
     DDR3_1600_8x8,
+    DsmTeeController,
+    DsmTeeMemoryDriver,
     L2XBar,
     MemCtrl,
     Process,
@@ -230,8 +232,8 @@ parser.add_argument(
         "all hosts. Defaults to using --mem-size for every host."
     ),
 )
-parser.add_argument("--sys-clock", default="3GHz")
-parser.add_argument("--cpu-clock", default="3GHz")
+parser.add_argument("--sys-clock", default="4GHz")
+parser.add_argument("--cpu-clock", default="4GHz")
 parser.add_argument(
     "--cwd", help="Semicolon-separated working directories, one per host."
 )
@@ -281,6 +283,139 @@ parser.add_argument(
         "membus and shared CXL memory."
     ),
 )
+parser.add_argument(
+    "--enable-dsm-tee",
+    action="store_true",
+    help=(
+        "Expose /dev/gem5_dsm_tee for SE DSM-TEE region creation and "
+        "fixed CXL physical mappings. This does not insert a controller into "
+        "the CXL data path."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-num-vmids",
+    type=int,
+    help=(
+        "Number of DSM-TEE VM identities. Defaults to total cores, with "
+        "VMID=cpu_id for the core/thread VM model."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-no-auto-grant-all",
+    action="store_false",
+    dest="dsm_tee_auto_grant_all",
+    default=True,
+    help=(
+        "Do not automatically grant RW access to every VMID on "
+        "mmap-created regions."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-no-auto-create-on-mmap",
+    action="store_false",
+    dest="dsm_tee_auto_create_on_mmap",
+    default=True,
+    help="Require explicit DSM-TEE create ioctl before mmap.",
+)
+parser.add_argument(
+    "--dsm-tee-data-path",
+    action="store_true",
+    help=(
+        "Insert the DSM-TEE controller into the CXL data path. Baseline "
+        "mode leaves the CXL path unchanged unless this flag is set."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-metadata-size",
+    default="4MiB",
+    help=(
+        "CXL memory reserved for DSM-TEE permission table and reverse page "
+        "table metadata."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-perm-cache-entries",
+    type=int,
+    default=256,
+    help="DSM-TEE data-path permission cache entries; 0 disables the cache.",
+)
+parser.add_argument(
+    "--dsm-tee-perm-cache-hit-latency",
+    default="0ns",
+    help="Additional DSM-TEE permission cache hit latency.",
+)
+parser.add_argument(
+    "--dsm-tee-perm-check-cycles",
+    type=int,
+    default=8,
+    help="Base DSM-TEE permission check latency in controller cycles.",
+)
+parser.add_argument(
+    "--dsm-tee-perm-cache-access-cycles",
+    type=int,
+    default=30,
+    help="DSM-TEE permission cache access latency in controller cycles.",
+)
+parser.add_argument(
+    "--dsm-tee-perm-cache-miss-latency",
+    default="0ns",
+    help="Additional DSM-TEE permission miss latency after metadata CXL read.",
+)
+parser.add_argument(
+    "--dsm-tee-metadata-read-latency",
+    help=(
+        "Latency to read DSM-TEE permission metadata from CXL memory on a "
+        "permission cache miss. Defaults to --cxl-latency."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-ide-req-delay",
+    default="0ns",
+    help="Additional DSM-TEE IDE/MAC absolute delay on CXL requests.",
+)
+parser.add_argument(
+    "--dsm-tee-ide-resp-delay",
+    default="0ns",
+    help="Additional DSM-TEE IDE/MAC absolute delay on CXL responses.",
+)
+parser.add_argument(
+    "--dsm-tee-ide-req-cycles",
+    type=int,
+    default=1,
+    help="DSM-TEE IDE/MAC processing cycles on CXL requests.",
+)
+parser.add_argument(
+    "--dsm-tee-ide-resp-cycles",
+    type=int,
+    default=1,
+    help="DSM-TEE IDE/MAC processing cycles on CXL responses.",
+)
+parser.add_argument(
+    "--dsm-tee-encrypt-read-delay",
+    default="10ns",
+    help="DSM-TEE decrypt/authenticate delay for CXL read responses.",
+)
+parser.add_argument(
+    "--dsm-tee-encrypt-write-delay",
+    default="10ns",
+    help="DSM-TEE encrypt/authenticate delay for CXL write requests.",
+)
+parser.add_argument(
+    "--dsm-tee-warn-only",
+    action="store_true",
+    help=(
+        "Warn instead of panicking on DSM-TEE data-path permission "
+        "violations."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-protect-unregistered-cxl",
+    action="store_true",
+    help=(
+        "Treat CXL addresses that are not registered DSM-TEE regions as "
+        "data-path violations instead of bypassing them."
+    ),
+)
 
 args = parser.parse_args()
 
@@ -313,6 +448,35 @@ host_mem_sizes = expand_list(
 )
 host_mem_sizes = [toMemorySize(size) for size in host_mem_sizes]
 cxl_mem_size = toMemorySize(args.cxl_mem_size)
+dsm_tee_metadata_size = toMemorySize(args.dsm_tee_metadata_size)
+dsm_tee_metadata_read_latency = (
+    args.dsm_tee_metadata_read_latency
+    if args.dsm_tee_metadata_read_latency
+    else args.cxl_latency
+)
+dsm_tee_num_vmids = (
+    args.dsm_tee_num_vmids if args.dsm_tee_num_vmids else total_cores
+)
+if dsm_tee_num_vmids <= 0:
+    raise ValueError("--dsm-tee-num-vmids must be positive")
+if args.enable_dsm_tee and cxl_mem_size <= 0:
+    raise ValueError("--enable-dsm-tee requires --cxl-mem-size > 0")
+if args.enable_dsm_tee and dsm_tee_metadata_size >= cxl_mem_size:
+    raise ValueError(
+        "--dsm-tee-metadata-size must be smaller than --cxl-mem-size"
+    )
+if args.dsm_tee_data_path and not args.enable_dsm_tee:
+    raise ValueError("--dsm-tee-data-path requires --enable-dsm-tee")
+if args.dsm_tee_perm_cache_entries < 0:
+    raise ValueError("--dsm-tee-perm-cache-entries must be non-negative")
+if args.dsm_tee_perm_check_cycles < 0:
+    raise ValueError("--dsm-tee-perm-check-cycles must be non-negative")
+if args.dsm_tee_perm_cache_access_cycles < 0:
+    raise ValueError("--dsm-tee-perm-cache-access-cycles must be non-negative")
+if args.dsm_tee_ide_req_cycles < 0:
+    raise ValueError("--dsm-tee-ide-req-cycles must be non-negative")
+if args.dsm_tee_ide_resp_cycles < 0:
+    raise ValueError("--dsm-tee-ide-resp-cycles must be non-negative")
 
 for cwd in cwd_list:
     if cwd and not os.path.isdir(cwd):
@@ -385,7 +549,21 @@ if cxl_mem_size > 0:
         memory_pool_id=cxl_pool_id,
     )
     for process in processes:
-        process.drivers = [system.cxl_mem_driver]
+        process.drivers = list(process.drivers) + [system.cxl_mem_driver]
+
+    if args.enable_dsm_tee:
+        system.dsm_tee_mem_driver = DsmTeeMemoryDriver(
+            filename="gem5_dsm_tee",
+            memory_pool_id=cxl_pool_id,
+            num_vmids=dsm_tee_num_vmids,
+            auto_grant_all=args.dsm_tee_auto_grant_all,
+            auto_create_on_mmap=args.dsm_tee_auto_create_on_mmap,
+            metadata_reserved_size=args.dsm_tee_metadata_size,
+        )
+        for process in processes:
+            process.drivers = list(process.drivers) + [
+                system.dsm_tee_mem_driver
+            ]
 
 core_index = 0
 for host_id, core_count in enumerate(host_core_counts):
@@ -445,8 +623,30 @@ if cxl_range is not None:
         write_req=args.cxl_link_delay,
         write_resp=args.cxl_link_delay,
     )
-    system.cxl_link.cpu_side_port = system.membus.mem_side_ports
-    system.cxl_link.mem_side_port = system.cxl_mem_ctrl.port
+    if args.dsm_tee_data_path:
+        system.dsm_tee_ctrl = DsmTeeController(
+            driver=system.dsm_tee_mem_driver,
+            perm_cache_entries=args.dsm_tee_perm_cache_entries,
+            perm_check_cycles=args.dsm_tee_perm_check_cycles,
+            perm_cache_access_cycles=args.dsm_tee_perm_cache_access_cycles,
+            perm_cache_hit_latency=args.dsm_tee_perm_cache_hit_latency,
+            perm_cache_miss_latency=args.dsm_tee_perm_cache_miss_latency,
+            metadata_read_latency=dsm_tee_metadata_read_latency,
+            ide_req_delay=args.dsm_tee_ide_req_delay,
+            ide_resp_delay=args.dsm_tee_ide_resp_delay,
+            ide_req_cycles=args.dsm_tee_ide_req_cycles,
+            ide_resp_cycles=args.dsm_tee_ide_resp_cycles,
+            encrypt_read_delay=args.dsm_tee_encrypt_read_delay,
+            encrypt_write_delay=args.dsm_tee_encrypt_write_delay,
+            deny_on_violation=not args.dsm_tee_warn_only,
+            bypass_non_dsm=not args.dsm_tee_protect_unregistered_cxl,
+        )
+        system.cxl_link.cpu_side_port = system.membus.mem_side_ports
+        system.cxl_link.mem_side_port = system.dsm_tee_ctrl.cpu_side_port
+        system.dsm_tee_ctrl.mem_side_port = system.cxl_mem_ctrl.port
+    else:
+        system.cxl_link.cpu_side_port = system.membus.mem_side_ports
+        system.cxl_link.mem_side_port = system.cxl_mem_ctrl.port
 
 root = Root(full_system=False, system=system)
 m5.instantiate()
@@ -473,6 +673,36 @@ if cxl_range is not None:
         f"latency={args.cxl_latency}, bandwidth={args.cxl_bandwidth}, "
         f"link_delay={args.cxl_link_delay}, device=/dev/gem5_cxl_mem"
     )
+    if args.enable_dsm_tee:
+        print(
+            "  dsm-tee: device=/dev/gem5_dsm_tee, "
+            f"vmid_policy=core, num_vmids={dsm_tee_num_vmids}, "
+            f"auto_grant_all={args.dsm_tee_auto_grant_all}, "
+            f"metadata_size={dsm_tee_metadata_size}, "
+            f"data_path={'enabled' if args.dsm_tee_data_path else 'unchanged'}"
+        )
+        if args.dsm_tee_data_path:
+            print(
+                "    data_path_model: "
+                "controller_location=device_side_after_cxl_link, "
+                f"perm_cache_entries={args.dsm_tee_perm_cache_entries}, "
+                f"perm_check={args.dsm_tee_perm_check_cycles}cy, "
+                "perm_cache_access="
+                f"{args.dsm_tee_perm_cache_access_cycles}cy, "
+                f"perm_hit_extra={args.dsm_tee_perm_cache_hit_latency}, "
+                f"metadata_read={dsm_tee_metadata_read_latency}, "
+                f"perm_miss_extra={args.dsm_tee_perm_cache_miss_latency}, "
+                f"ide_req={args.dsm_tee_ide_req_cycles}cy+"
+                f"{args.dsm_tee_ide_req_delay}, "
+                f"ide_resp={args.dsm_tee_ide_resp_cycles}cy+"
+                f"{args.dsm_tee_ide_resp_delay}, "
+                f"decrypt_read={args.dsm_tee_encrypt_read_delay}, "
+                f"encrypt_write={args.dsm_tee_encrypt_write_delay}, "
+                f"deny_on_violation={not args.dsm_tee_warn_only}, "
+                f"bypass_non_dsm={not args.dsm_tee_protect_unregistered_cxl}"
+            )
+        for core_id, host_id in enumerate(core_to_host):
+            print(f"    cpu{core_id}: host{host_id}, vmid={core_id}")
 else:
     print("  cxl: disabled")
 

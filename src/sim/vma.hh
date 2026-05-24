@@ -29,6 +29,8 @@
 #ifndef __SRC_MEM_VMA_HH__
 #define __SRC_MEM_VMA_HH__
 
+#include <cassert>
+#include <limits>
 #include <string>
 
 #include "base/addr_range.hh"
@@ -46,9 +48,13 @@ class VMA
 
   public:
     VMA(AddrRange r, Addr page_bytes, const std::string& vma_name="anon",
-        int fd=-1, off_t off=0, int memory_pool_id=-1)
+        int fd=-1, off_t off=0, int memory_pool_id=-1,
+        Addr fixed_paddr_base=std::numeric_limits<Addr>::max(),
+        bool dealloc_on_unmap=true, uint64_t region_id=0)
         : _addrRange(r), _pageBytes(page_bytes),
-          _memoryPoolId(memory_pool_id), _vmaName(vma_name)
+          _memoryPoolId(memory_pool_id), _fixedPaddrBase(fixed_paddr_base),
+          _deallocOnUnmap(dealloc_on_unmap), _regionId(region_id),
+          _vmaName(vma_name)
     {
         DPRINTF(Vma, "Creating vma start %#x len %llu end %#x\n",
                 r.start(), r.size(), r.end());
@@ -112,6 +118,20 @@ class VMA
     }
 
     int memoryPoolId() const { return _memoryPoolId; }
+    bool deallocOnUnmap() const { return _deallocOnUnmap; }
+    uint64_t regionId() const { return _regionId; }
+    bool
+    hasFixedPaddr() const
+    {
+        return _fixedPaddrBase != std::numeric_limits<Addr>::max();
+    }
+    Addr
+    fixedPaddrFor(Addr vaddr) const
+    {
+        assert(hasFixedPaddr());
+        return _fixedPaddrBase + (vaddr - _addrRange.start());
+    }
+    Addr fixedPaddrBase() const { return _fixedPaddrBase; }
 
     /**
      * Defer AddrRange related calls to the AddrRange.
@@ -162,6 +182,24 @@ class VMA
      * owning process' default pool.
      */
     int _memoryPoolId;
+
+    /**
+     * Optional fixed physical backing for this VMA. DSM-TEE regions use this
+     * to map multiple virtual mappings to the same CXL physical pages.
+     */
+    Addr _fixedPaddrBase;
+
+    /**
+     * Whether unmapping this VMA owns and releases physical pages. DSM-TEE
+     * VMA mappings are views of a region-owned allocation, so they do not free
+     * pages on munmap.
+     */
+    bool _deallocOnUnmap;
+
+    /**
+     * DSM-TEE region identifier. Zero means this is not a DSM-TEE region.
+     */
+    uint64_t _regionId;
 
     /**
      * The host file backing will be chopped up and reassigned as pages are

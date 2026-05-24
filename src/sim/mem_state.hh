@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <limits>
 #include <list>
 #include <memory>
 #include <string>
@@ -129,7 +130,9 @@ class MemState : public Serializable
      */
     void mapRegion(Addr start_addr, Addr length,
                    const std::string& name="anon", int sim_fd=-1,
-                   Addr offset=0, int memory_pool_id=-1);
+                   Addr offset=0, int memory_pool_id=-1,
+                   Addr fixed_paddr_base=std::numeric_limits<Addr>::max(),
+                   bool dealloc_on_unmap=true, uint64_t region_id=0);
 
     /**
      * Unmap a pre-existing region. Depending on the range being unmapped
@@ -203,6 +206,9 @@ class MemState : public Serializable
             ScopedCheckpointSection sec(cp, csprintf("Vma%d", count++));
             paramOut(cp, "name", vma.getName());
             paramOut(cp, "memoryPoolId", vma.memoryPoolId());
+            paramOut(cp, "fixedPaddrBase", vma.fixedPaddrBase());
+            paramOut(cp, "deallocOnUnmap", vma.deallocOnUnmap());
+            paramOut(cp, "regionId", vma.regionId());
             if (vma.hasHostBuf()) {
                 paramOut(cp, "fileOffset", vma.getFileMappingOffset());
             }
@@ -233,8 +239,14 @@ class MemState : public Serializable
             off_t offset = 0;
             int host_fd = -1;
             int memory_pool_id = -1;
+            Addr fixed_paddr_base = std::numeric_limits<Addr>::max();
+            bool dealloc_on_unmap = true;
+            uint64_t region_id = 0;
             paramIn(cp, "name", name);
             optParamIn(cp, "memoryPoolId", memory_pool_id, false);
+            optParamIn(cp, "fixedPaddrBase", fixed_paddr_base, false);
+            optParamIn(cp, "deallocOnUnmap", dealloc_on_unmap, false);
+            optParamIn(cp, "regionId", region_id, false);
             if (optParamIn(cp, "fileOffset", offset, false)) {
                 host_fd = open(name.c_str(), O_RDONLY);
                 fatal_if(host_fd < 0,
@@ -244,7 +256,9 @@ class MemState : public Serializable
             paramIn(cp, "addrRangeStart", start);
             paramIn(cp, "addrRangeEnd", end);
             _vmaList.emplace_back(AddrRange(start, end), _pageBytes, name,
-                                  host_fd, offset, memory_pool_id);
+                                  host_fd, offset, memory_pool_id,
+                                  fixed_paddr_base, dealloc_on_unmap,
+                                  region_id);
             close(host_fd);
         }
     }

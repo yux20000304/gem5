@@ -130,11 +130,17 @@ GTest('serialize_handlers.test', 'serialize_handlers.test.cc')
 SimObject('InstTracer.py', sim_objects=['InstTracer', 'InstDisassembler'])
 SimObject(
     'Process.py',
-    sim_objects=['Process', 'EmulatedDriver', 'CxlMemoryDriver']
+    sim_objects=[
+        'Process',
+        'EmulatedDriver',
+        'CxlMemoryDriver',
+        'DsmTeeMemoryDriver',
+    ]
 )
 Source('faults.cc')
 Source('process.cc')
 Source('cxl_memory_driver.cc')
+Source('dsm_tee_memory_driver.cc')
 Source('fd_array.cc')
 Source('fd_entry.cc')
 Source('mem_state.cc')
