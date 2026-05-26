@@ -10,6 +10,8 @@ from m5.objects import (
     Cache,
     CxlMemoryDriver,
     DDR3_1600_8x8,
+    DDR5_4400_4x8,
+    DDR5_6400_4x8,
     DsmTeeController,
     DsmTeeMemoryDriver,
     L2XBar,
@@ -23,7 +25,12 @@ from m5.objects import (
     System,
     SystemXBar,
     VoltageDomain,
+    X86AtomicSimpleCPU,
     X86TimingSimpleCPU,
+)
+from m5.simulate import (
+    memInvalidate,
+    memWriteback,
 )
 from m5.util.convert import toMemorySize
 
@@ -76,9 +83,40 @@ class FastSimpleMemory(SimpleMemory):
     latency = "1ns"
 
 
+PAPER_CXL_DDR5_READ_LATENCY = "42ns"
+PAPER_CXL_LINK_ONE_WAY_DELAY = "35ns"
+PAPER_CXL_BANDWIDTH = "25.6GB/s"
+
+
 CPU_TYPES = {
     "timing": X86TimingSimpleCPU,
     "o3": X86O3CPU,
+}
+
+
+def make_paper_ddr5_4400():
+    return DDR5_4400_4x8(
+        tRCD="14ns",
+        tCL="14ns",
+        tRP="14ns",
+        tRAS="32ns",
+        tWR="30ns",
+    )
+
+
+def make_paper_ddr5_6400():
+    return DDR5_6400_4x8(
+        tRCD="14ns",
+        tCL="14ns",
+        tRP="14ns",
+        tRAS="32ns",
+        tWR="30ns",
+    )
+
+
+PAPER_DDR5_FACTORIES = {
+    "ddr5-4400": make_paper_ddr5_4400,
+    "ddr5-6400": make_paper_ddr5_6400,
 }
 
 
@@ -221,9 +259,38 @@ parser.add_argument(
     "--cpu",
     choices=CPU_TYPES,
     default="timing",
-    help="CPU model. Atomic is intentionally unsupported because this script models LLCs.",
+    help="Detailed ROI CPU model. Atomic is only used internally by --fast-forward-to-roi.",
 )
-parser.add_argument("--mem", choices=["simple", "ddr3"], default="simple")
+parser.add_argument(
+    "--fast-forward-to-roi",
+    action="store_true",
+    help=(
+        "Start with X86AtomicSimpleCPU and switch to --cpu at the first "
+        "m5_work_begin. Requires the workload to emit workbegin/workend "
+        "annotations, e.g. GAPBS_M5_ROI=1."
+    ),
+)
+parser.add_argument(
+    "--roi-exit-after-workend",
+    action="store_true",
+    default=True,
+    help="Exit simulation after dumping stats at the first m5_work_end.",
+)
+parser.add_argument(
+    "--roi-continue-after-workend",
+    action="store_false",
+    dest="roi_exit_after_workend",
+    help="After dumping ROI stats, continue executing the workload.",
+)
+parser.add_argument(
+    "--mem",
+    choices=["simple", "ddr3", "ddr5-4400", "ddr5-6400"],
+    default="ddr5-6400",
+    help=(
+        "Host private memory model. ddr5-4400 and ddr5-6400 use "
+        "tRCD/tCL/tRP/tRAS/tWR=14/14/14/32/30ns."
+    ),
+)
 parser.add_argument("--mem-size", default="4GiB")
 parser.add_argument(
     "--host-mem-size",
@@ -267,22 +334,44 @@ parser.add_argument(
 )
 parser.add_argument(
     "--cxl-latency",
-    default="150ns",
-    help="SimpleMemory access latency for the shared CXL memory range.",
+    default=PAPER_CXL_DDR5_READ_LATENCY,
+    help=(
+        "SimpleMemory access latency for shared CXL memory and default "
+        "DSM-TEE metadata-read latency. The paper DDR5 row-miss read "
+        "timing is tRP+tRCD+tCL=42ns."
+    ),
 )
 parser.add_argument(
     "--cxl-bandwidth",
-    default="32GiB/s",
-    help="SimpleMemory bandwidth for the shared CXL memory range.",
+    default=PAPER_CXL_BANDWIDTH,
+    help=(
+        "SimpleMemory bandwidth for the shared CXL memory range. Ignored "
+        "when --cxl-mem-type uses a DDR5 MemCtrl model."
+    ),
+)
+parser.add_argument(
+    "--cxl-mem-type",
+    choices=["simple", "ddr5-4400", "ddr5-6400"],
+    default="ddr5-6400",
+    help=(
+        "Shared CXL memory model. ddr5-4400 and ddr5-6400 use "
+        "tRCD/tCL/tRP/tRAS/tWR=14/14/14/32/30ns."
+    ),
 )
 parser.add_argument(
     "--cxl-link-delay",
-    default="0ns",
+    default=PAPER_CXL_LINK_ONE_WAY_DELAY,
     help=(
-        "Per-direction request/response delay inserted between the coherent "
-        "membus and shared CXL memory."
+        "Default per-direction request/response delay inserted between the "
+        "coherent membus and shared CXL memory. The paper uses 70ns CXL "
+        "round-trip latency, modeled by default as 35ns request + 35ns "
+        "response."
     ),
 )
+parser.add_argument("--cxl-link-read-req-delay")
+parser.add_argument("--cxl-link-read-resp-delay")
+parser.add_argument("--cxl-link-write-req-delay")
+parser.add_argument("--cxl-link-write-resp-delay")
 parser.add_argument(
     "--enable-dsm-tee",
     action="store_true",
@@ -365,7 +454,16 @@ parser.add_argument(
     "--dsm-tee-metadata-read-latency",
     help=(
         "Latency to read DSM-TEE permission metadata from CXL memory on a "
-        "permission cache miss. Defaults to --cxl-latency."
+        "permission cache miss when metadata packets are disabled. Defaults "
+        "to --cxl-latency."
+    ),
+)
+parser.add_argument(
+    "--dsm-tee-no-metadata-packets",
+    action="store_true",
+    help=(
+        "Use the legacy fixed metadata-read latency instead of issuing real "
+        "metadata read packets on permission cache misses."
     ),
 )
 parser.add_argument(
@@ -454,6 +552,26 @@ dsm_tee_metadata_read_latency = (
     if args.dsm_tee_metadata_read_latency
     else args.cxl_latency
 )
+cxl_link_read_req_delay = (
+    args.cxl_link_read_req_delay
+    if args.cxl_link_read_req_delay
+    else args.cxl_link_delay
+)
+cxl_link_read_resp_delay = (
+    args.cxl_link_read_resp_delay
+    if args.cxl_link_read_resp_delay
+    else args.cxl_link_delay
+)
+cxl_link_write_req_delay = (
+    args.cxl_link_write_req_delay
+    if args.cxl_link_write_req_delay
+    else args.cxl_link_delay
+)
+cxl_link_write_resp_delay = (
+    args.cxl_link_write_resp_delay
+    if args.cxl_link_write_resp_delay
+    else args.cxl_link_delay
+)
 dsm_tee_num_vmids = (
     args.dsm_tee_num_vmids if args.dsm_tee_num_vmids else total_cores
 )
@@ -499,22 +617,26 @@ for process_id in range(num_processes):
 if args.mode == "cross-host-threaded":
     processes[0].crossHostThreads = True
 
-cpu_cls = CPU_TYPES[args.cpu]
+detailed_cpu_cls = CPU_TYPES[args.cpu]
+startup_cpu_cls = (
+    X86AtomicSimpleCPU if args.fast_forward_to_roi else detailed_cpu_cls
+)
 
 core_to_host = []
 for host_id, count in enumerate(host_core_counts):
     core_to_host.extend([host_id] * count)
 
 cpus = [
-    cpu_cls(cpu_id=core_id, socket_id=core_to_host[core_id])
+    startup_cpu_cls(cpu_id=core_id, socket_id=core_to_host[core_id])
     for core_id in range(total_cores)
 ]
 
 system = System(
     cpu=cpus,
-    mem_mode="timing",
+    mem_mode="atomic" if args.fast_forward_to_roi else "timing",
     mem_ranges=[],
 )
+system.exit_on_work_items = args.fast_forward_to_roi
 system.workload = SEWorkload.init_compatible(processes[0].executable)
 system.clk_domain = SrcClockDomain()
 system.clk_domain.clock = args.sys_clock
@@ -527,6 +649,23 @@ system.system_port = system.membus.cpu_side_ports
 
 for cpu in system.cpu:
     cpu.clk_domain = system.cpu_clk_domain
+
+switch_cpu_list = []
+if args.fast_forward_to_roi:
+    system.switch_cpus = [
+        detailed_cpu_cls(
+            switched_out=True,
+            cpu_id=core_id,
+            socket_id=core_to_host[core_id],
+        )
+        for core_id in range(total_cores)
+    ]
+    for cpu in system.switch_cpus:
+        cpu.clk_domain = system.cpu_clk_domain
+    switch_cpu_list = [
+        (system.cpu[core_id], system.switch_cpus[core_id])
+        for core_id in range(total_cores)
+    ]
 
 host_mem_ranges = []
 host_mem_base = 0
@@ -576,7 +715,14 @@ for host_id, core_count in enumerate(host_core_counts):
     setattr(system, f"host{host_id}_llc", host_llc)
 
     for _ in range(core_count):
+        workload = (
+            processes[0]
+            if args.mode == "cross-host-threaded"
+            else processes[host_id]
+        )
         cpu = system.cpu[core_index]
+        cpu.workload = workload
+
         cpu.addPrivateSplitL1Caches(
             L1ICache(size=args.l1i_size),
             L1DCache(size=args.l1d_size),
@@ -589,12 +735,13 @@ for host_id, core_count in enumerate(host_core_counts):
             system.membus.cpu_side_ports,
             system.membus.mem_side_ports,
         )
-        cpu.workload = (
-            processes[0]
-            if args.mode == "cross-host-threaded"
-            else processes[host_id]
-        )
         cpu.createThreads()
+
+        if args.fast_forward_to_roi:
+            timing_cpu = system.switch_cpus[core_index]
+            timing_cpu.workload = workload
+            timing_cpu.isa = cpu.isa
+            timing_cpu.createThreads()
         core_index += 1
 
 for host_id, host_range in enumerate(host_mem_ranges):
@@ -602,26 +749,36 @@ for host_id, host_range in enumerate(host_mem_ranges):
         mem_ctrl = FastSimpleMemory()
         mem_ctrl.range = host_range
         mem_ctrl.port = system.membus.mem_side_ports
-    else:
+    elif args.mem == "ddr3":
         mem_ctrl = MemCtrl()
         mem_ctrl.dram = DDR3_1600_8x8()
+        mem_ctrl.dram.range = host_range
+        mem_ctrl.port = system.membus.mem_side_ports
+    else:
+        mem_ctrl = MemCtrl()
+        mem_ctrl.dram = PAPER_DDR5_FACTORIES[args.mem]()
         mem_ctrl.dram.range = host_range
         mem_ctrl.port = system.membus.mem_side_ports
 
     setattr(system, f"host{host_id}_mem_ctrl", mem_ctrl)
 
 if cxl_range is not None:
-    system.cxl_mem_ctrl = FastSimpleMemory(
-        latency=args.cxl_latency,
-        bandwidth=args.cxl_bandwidth,
-    )
-    system.cxl_mem_ctrl.range = cxl_range
+    if args.cxl_mem_type == "simple":
+        system.cxl_mem_ctrl = FastSimpleMemory(
+            latency=args.cxl_latency,
+            bandwidth=args.cxl_bandwidth,
+        )
+        system.cxl_mem_ctrl.range = cxl_range
+    else:
+        system.cxl_mem_ctrl = MemCtrl()
+        system.cxl_mem_ctrl.dram = PAPER_DDR5_FACTORIES[args.cxl_mem_type]()
+        system.cxl_mem_ctrl.dram.range = cxl_range
 
     system.cxl_link = SimpleMemDelay(
-        read_req=args.cxl_link_delay,
-        read_resp=args.cxl_link_delay,
-        write_req=args.cxl_link_delay,
-        write_resp=args.cxl_link_delay,
+        read_req=cxl_link_read_req_delay,
+        read_resp=cxl_link_read_resp_delay,
+        write_req=cxl_link_write_req_delay,
+        write_resp=cxl_link_write_resp_delay,
     )
     if args.dsm_tee_data_path:
         system.dsm_tee_ctrl = DsmTeeController(
@@ -632,6 +789,7 @@ if cxl_range is not None:
             perm_cache_hit_latency=args.dsm_tee_perm_cache_hit_latency,
             perm_cache_miss_latency=args.dsm_tee_perm_cache_miss_latency,
             metadata_read_latency=dsm_tee_metadata_read_latency,
+            metadata_read_packets=not args.dsm_tee_no_metadata_packets,
             ide_req_delay=args.dsm_tee_ide_req_delay,
             ide_resp_delay=args.dsm_tee_ide_resp_delay,
             ide_req_cycles=args.dsm_tee_ide_req_cycles,
@@ -653,6 +811,11 @@ m5.instantiate()
 
 print("Pseudo multi-host SE topology")
 print(f"  mode: {args.mode}")
+print(
+    "  cpu: "
+    f"startup={'atomic' if args.fast_forward_to_roi else args.cpu}, "
+    f"roi={args.cpu}, fast_forward_to_roi={args.fast_forward_to_roi}"
+)
 print(f"  hosts: {num_hosts}")
 print(f"  total cores: {total_cores}")
 for host_id, core_count in enumerate(host_core_counts):
@@ -670,8 +833,11 @@ for host_id, core_count in enumerate(host_core_counts):
 if cxl_range is not None:
     print(
         f"  cxl: pool={cxl_pool_id}, mem={cxl_mem_size}, range={cxl_range}, "
-        f"latency={args.cxl_latency}, bandwidth={args.cxl_bandwidth}, "
-        f"link_delay={args.cxl_link_delay}, device=/dev/gem5_cxl_mem"
+        f"mem_type={args.cxl_mem_type}, simple_latency={args.cxl_latency}, "
+        f"simple_bandwidth={args.cxl_bandwidth}, "
+        f"link_read={cxl_link_read_req_delay}+{cxl_link_read_resp_delay}, "
+        f"link_write={cxl_link_write_req_delay}+{cxl_link_write_resp_delay}, "
+        "device=/dev/gem5_cxl_mem"
     )
     if args.enable_dsm_tee:
         print(
@@ -691,6 +857,7 @@ if cxl_range is not None:
                 f"{args.dsm_tee_perm_cache_access_cycles}cy, "
                 f"perm_hit_extra={args.dsm_tee_perm_cache_hit_latency}, "
                 f"metadata_read={dsm_tee_metadata_read_latency}, "
+                f"metadata_packets={not args.dsm_tee_no_metadata_packets}, "
                 f"perm_miss_extra={args.dsm_tee_perm_cache_miss_latency}, "
                 f"ide_req={args.dsm_tee_ide_req_cycles}cy+"
                 f"{args.dsm_tee_ide_req_delay}, "
@@ -706,6 +873,37 @@ if cxl_range is not None:
 else:
     print("  cxl: disabled")
 
-exit_event = m5.simulate()
+if args.fast_forward_to_roi:
+    print("Fast-forward to ROI: waiting for m5_work_begin")
+    switched_to_roi = False
+    exit_event = None
+
+    while True:
+        exit_event = m5.simulate()
+        cause = exit_event.getCause()
+        print(f"Simulation event @ tick {m5.curTick()}: {cause}")
+
+        if cause == "workbegin":
+            if not switched_to_roi:
+                m5.switchCpus(system, switch_cpu_list)
+                switched_to_roi = True
+                print(f"Switched to ROI CPUs @ tick {m5.curTick()}")
+            memWriteback(root)
+            memInvalidate(root)
+            print("ROI caches writeback+invalidate")
+            m5.stats.reset()
+            print("ROI stats reset")
+        elif cause == "workend":
+            m5.stats.dump()
+            print("ROI stats dumped")
+            if args.roi_exit_after_workend:
+                break
+        else:
+            if not switched_to_roi:
+                print("Warning: workload exited before emitting m5_work_begin")
+            break
+else:
+    exit_event = m5.simulate()
+
 print(f"Exit tick: {m5.curTick()}")
 print(f"Exit cause: {exit_event.getCause()}")

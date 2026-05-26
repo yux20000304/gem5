@@ -243,6 +243,21 @@ TimingSimpleCPU::suspendContext(ThreadID thread_num)
     if (_status == Idle)
         return;
 
+    if (_status != BaseSimpleCPU::Running &&
+        threadInfo[thread_num]->thread->status() == ThreadContext::Halted) {
+        threadInfo[thread_num]->execContextStats.notIdleFraction = 0;
+        if (activeThreads.empty()) {
+            _status = Idle;
+
+            if (fetchEvent.scheduled()) {
+                deschedule(fetchEvent);
+            }
+        }
+
+        BaseCPU::suspendContext(thread_num);
+        return;
+    }
+
     assert(_status == BaseSimpleCPU::Running);
 
     threadInfo[thread_num]->execContextStats.notIdleFraction = 0;

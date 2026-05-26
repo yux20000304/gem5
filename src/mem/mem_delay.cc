@@ -94,11 +94,7 @@ MemDelay::RequestPort::recvTimingResp(PacketPtr pkt)
     const Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
     pkt->headerDelay = pkt->payloadDelay = 0;
 
-    const Tick when = curTick() + parent.delayResp(pkt) + receive_delay;
-
-    parent.responsePort.schedTimingResp(pkt, when);
-
-    return true;
+    return parent.recvTimingResp(pkt, receive_delay);
 }
 
 void
@@ -150,11 +146,7 @@ MemDelay::ResponsePort::recvTimingReq(PacketPtr pkt)
     Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
     pkt->headerDelay = pkt->payloadDelay = 0;
 
-    const Tick when = curTick() + parent.delayReq(pkt) + receive_delay;
-
-    parent.requestPort.schedTimingReq(pkt, when);
-
-    return true;
+    return parent.recvTimingReq(pkt, receive_delay);
 }
 
 void
@@ -174,6 +166,22 @@ MemDelay::ResponsePort::recvTimingSnoopResp(PacketPtr pkt)
 
     parent.requestPort.schedTimingSnoopResp(pkt, when);
 
+    return true;
+}
+
+bool
+MemDelay::recvTimingReq(PacketPtr pkt, Tick receive_delay)
+{
+    const Tick when = curTick() + delayReq(pkt) + receive_delay;
+    requestPort.schedTimingReq(pkt, when);
+    return true;
+}
+
+bool
+MemDelay::recvTimingResp(PacketPtr pkt, Tick receive_delay)
+{
+    const Tick when = curTick() + delayResp(pkt) + receive_delay;
+    responsePort.schedTimingResp(pkt, when);
     return true;
 }
 

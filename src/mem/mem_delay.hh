@@ -134,6 +134,21 @@ class MemDelay : public ClockedObject
 
   protected:
     /**
+     * Handle a timing request received from the CPU-side port.
+     *
+     * Subclasses can override this when a request must trigger additional
+     * downstream packets before the original request is forwarded.
+     */
+    virtual bool recvTimingReq(PacketPtr pkt, Tick receive_delay);
+
+    /**
+     * Handle a timing response received from the memory-side port.
+     *
+     * Subclasses can override this to consume internally generated packets.
+     */
+    virtual bool recvTimingResp(PacketPtr pkt, Tick receive_delay);
+
+    /**
      * Delay a request by some number of ticks.
      *
      * @return Ticks to delay packet.

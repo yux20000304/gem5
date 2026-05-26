@@ -59,6 +59,7 @@
 #if defined(__linux__)
 #include <linux/kdev_t.h>
 #include <sched.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/sendfile.h>
 #include <sys/statfs.h>
@@ -2845,6 +2846,100 @@ selectFunc(SyscallDesc *desc, ThreadContext *tc, int nfds,
 
 template <class OS>
 SyscallReturn
+pselect6Func(SyscallDesc *desc, ThreadContext *tc, int nfds,
+             VPtr<typename OS::fd_set> readfds,
+             VPtr<typename OS::fd_set> writefds,
+             VPtr<typename OS::fd_set> errorfds,
+             VPtr<typename OS::timespec> timeout,
+             VPtr<> sigmask)
+{
+    (void)desc;
+    (void)sigmask;
+
+    auto p = tc->getProcessPtr();
+
+    fd_set readfds_h;
+    FD_ZERO(&readfds_h);
+    fd_set writefds_h;
+    FD_ZERO(&writefds_h);
+    fd_set errorfds_h;
+    FD_ZERO(&errorfds_h);
+
+    int nfds_h = 0;
+    std::map<int, int> trans_map;
+    auto try_add_host_set = [&](typename OS::fd_set *tgt_set_entry,
+                                fd_set *hst_set_entry,
+                                int iter) -> bool
+    {
+        if (FD_ISSET(iter, (fd_set *)tgt_set_entry)) {
+            auto hbfdp = std::dynamic_pointer_cast<HBFDEntry>((*p->fds)[iter]);
+            if (!hbfdp)
+                return true;
+            int sim_fd = hbfdp->getSimFD();
+            trans_map[sim_fd] = iter;
+            nfds_h = std::max(nfds_h, sim_fd + 1);
+            FD_SET(sim_fd, hst_set_entry);
+        }
+        return false;
+    };
+
+    for (int i = 0; i < nfds; i++) {
+        if (readfds && try_add_host_set(readfds, &readfds_h, i))
+            return -EBADF;
+        if (writefds && try_add_host_set(writefds, &writefds_h, i))
+            return -EBADF;
+        if (errorfds && try_add_host_set(errorfds, &errorfds_h, i))
+            return -EBADF;
+    }
+
+    /*
+     * pselect6 is used by glibc's select() on x86-64.  Never block the host
+     * gem5 process here.  For a target timeout, returning 0 is important so
+     * Redis can run time events such as the CXL ring poller.
+     */
+    struct timeval tv = {0, 0};
+    int retval = select(nfds_h,
+                        readfds ? &readfds_h : nullptr,
+                        writefds ? &writefds_h : nullptr,
+                        errorfds ? &errorfds_h : nullptr,
+                        &tv);
+    if (retval == -1)
+        return -errno;
+
+    if (retval == 0 && !timeout) {
+        for (auto sig : tc->getSystemPtr()->signalList)
+            if (sig.receiver == p)
+                return -EINTR;
+        return SyscallReturn::retry();
+    }
+
+    if (readfds)
+        FD_ZERO(reinterpret_cast<fd_set *>((typename OS::fd_set *)readfds));
+    if (writefds)
+        FD_ZERO(reinterpret_cast<fd_set *>((typename OS::fd_set *)writefds));
+    if (errorfds)
+        FD_ZERO(reinterpret_cast<fd_set *>((typename OS::fd_set *)errorfds));
+
+    for (int i = 0; i < nfds_h; i++) {
+        if (readfds && FD_ISSET(i, &readfds_h))
+            FD_SET(trans_map[i],
+                   reinterpret_cast<fd_set *>(
+                       (typename OS::fd_set *)readfds));
+        if (writefds && FD_ISSET(i, &writefds_h))
+            FD_SET(trans_map[i],
+                   reinterpret_cast<fd_set *>(
+                       (typename OS::fd_set *)writefds));
+        if (errorfds && FD_ISSET(i, &errorfds_h))
+            FD_SET(trans_map[i],
+                   reinterpret_cast<fd_set *>(
+                       (typename OS::fd_set *)errorfds));
+    }
+
+    return retval;
+}
+
+template <class OS>
+SyscallReturn
 readFunc(SyscallDesc *desc, ThreadContext *tc,
         int tgt_fd, VPtr<> buf_ptr, typename OS::size_t nbytes)
 {
@@ -3034,6 +3129,82 @@ acceptFunc(SyscallDesc *desc, ThreadContext *tc,
     return p->fds->allocFD(afdp);
 }
 
+template <class OS>
+SyscallReturn
+accept4Func(SyscallDesc *desc, ThreadContext *tc,
+            int tgt_fd, VPtr<> addrPtr, VPtr<> lenPtr, int flags)
+{
+#if defined(__linux__)
+    struct sockaddr sa;
+    socklen_t addrLen = sizeof(sa);
+    auto p = tc->getProcessPtr();
+
+    BufferArg *lenBufPtr = nullptr;
+    BufferArg *addrBufPtr = nullptr;
+
+    auto sfdp = std::dynamic_pointer_cast<SocketFDEntry>((*p->fds)[tgt_fd]);
+    if (!sfdp)
+        return -EBADF;
+    int sim_fd = sfdp->getSimFD();
+
+    struct pollfd pfd;
+    pfd.fd = sim_fd;
+    pfd.events = POLLIN | POLLPRI;
+    if ((poll(&pfd, 1, 0) == 0) && !(sfdp->getFlags() & OS::TGT_O_NONBLOCK))
+        return SyscallReturn::retry();
+
+    if (lenPtr) {
+        lenBufPtr = new BufferArg(lenPtr, sizeof(socklen_t));
+        lenBufPtr->copyIn(SETranslatingPortProxy(tc));
+        memcpy(&addrLen, (socklen_t *)lenBufPtr->bufferPtr(),
+               sizeof(socklen_t));
+    }
+
+    if (addrPtr) {
+        addrBufPtr = new BufferArg(addrPtr, sizeof(struct sockaddr));
+        addrBufPtr->copyIn(SETranslatingPortProxy(tc));
+        memcpy(&sa, (struct sockaddr *)addrBufPtr->bufferPtr(),
+               sizeof(struct sockaddr));
+    }
+
+    int host_flags = 0;
+    int target_flags = 0;
+    if (flags & OS::TGT_O_NONBLOCK) {
+        host_flags |= SOCK_NONBLOCK;
+        target_flags |= OS::TGT_O_NONBLOCK;
+    }
+    if (flags & OS::TGT_O_CLOEXEC) {
+        host_flags |= SOCK_CLOEXEC;
+        target_flags |= OS::TGT_O_CLOEXEC;
+    }
+
+    int host_fd = accept4(sim_fd, &sa, &addrLen, host_flags);
+    if (host_fd == -1)
+        return -errno;
+
+    if (addrPtr) {
+        memcpy(addrBufPtr->bufferPtr(), &sa, sizeof(sa));
+        addrBufPtr->copyOut(SETranslatingPortProxy(tc));
+        delete(addrBufPtr);
+    }
+
+    if (lenPtr) {
+        *(socklen_t *)lenBufPtr->bufferPtr() = addrLen;
+        lenBufPtr->copyOut(SETranslatingPortProxy(tc));
+        delete(lenBufPtr);
+    }
+
+    bool cloexec = flags & OS::TGT_O_CLOEXEC;
+    auto afdp = std::make_shared<SocketFDEntry>(
+        host_fd, sfdp->_domain, sfdp->_type, sfdp->_protocol, cloexec);
+    afdp->setFlags(target_flags);
+    return p->fds->allocFD(afdp);
+#else
+    warnUnsupportedOS("accept4");
+    return -1;
+#endif
+}
+
 /// Target eventfd() function.
 template <class OS>
 SyscallReturn
@@ -3057,6 +3228,113 @@ eventfdFunc(SyscallDesc *desc, ThreadContext *tc,
     return tgt_fd;
 #else
     warnUnsupportedOS("eventfd");
+    return -1;
+#endif
+}
+
+template <class OS>
+SyscallReturn
+epollCreateFunc(SyscallDesc *desc, ThreadContext *tc, int size)
+{
+#if defined(__linux__)
+    if (size <= 0)
+        return -EINVAL;
+
+    auto p = tc->getProcessPtr();
+    int sim_fd = epoll_create(size);
+    if (sim_fd == -1)
+        return -errno;
+
+    auto hbfdp = std::make_shared<HBFDEntry>(0, sim_fd);
+    return p->fds->allocFD(hbfdp);
+#else
+    warnUnsupportedOS("epoll_create");
+    return -1;
+#endif
+}
+
+template <class OS>
+SyscallReturn
+epollCreate1Func(SyscallDesc *desc, ThreadContext *tc, int flags)
+{
+#if defined(__linux__)
+    auto p = tc->getProcessPtr();
+    int sim_fd = epoll_create1(flags);
+    if (sim_fd == -1)
+        return -errno;
+
+    bool cloexec = flags & OS::TGT_O_CLOEXEC;
+    auto hbfdp = std::make_shared<HBFDEntry>(flags, sim_fd, cloexec);
+    return p->fds->allocFD(hbfdp);
+#else
+    warnUnsupportedOS("epoll_create1");
+    return -1;
+#endif
+}
+
+template <class OS>
+SyscallReturn
+epollCtlFunc(SyscallDesc *desc, ThreadContext *tc, int tgt_epfd, int op,
+             int tgt_fd, VPtr<> event_ptr)
+{
+#if defined(__linux__)
+    auto p = tc->getProcessPtr();
+    auto epfdp = std::dynamic_pointer_cast<HBFDEntry>((*p->fds)[tgt_epfd]);
+    auto fdp = std::dynamic_pointer_cast<HBFDEntry>((*p->fds)[tgt_fd]);
+    if (!epfdp || !fdp)
+        return -EBADF;
+
+    struct epoll_event event;
+    struct epoll_event *eventp = nullptr;
+    BufferArg eventBuf(event_ptr, sizeof(event));
+    if (event_ptr) {
+        eventBuf.copyIn(SETranslatingPortProxy(tc));
+        memcpy(&event, eventBuf.bufferPtr(), sizeof(event));
+        eventp = &event;
+    }
+
+    int status = epoll_ctl(epfdp->getSimFD(), op, fdp->getSimFD(), eventp);
+    return status == -1 ? -errno : status;
+#else
+    warnUnsupportedOS("epoll_ctl");
+    return -1;
+#endif
+}
+
+template <class OS>
+SyscallReturn
+epollWaitFunc(SyscallDesc *desc, ThreadContext *tc, int tgt_epfd,
+              VPtr<> events_ptr, int maxevents, int timeout)
+{
+#if defined(__linux__)
+    if (maxevents <= 0)
+        return -EINVAL;
+
+    auto p = tc->getProcessPtr();
+    auto epfdp = std::dynamic_pointer_cast<HBFDEntry>((*p->fds)[tgt_epfd]);
+    if (!epfdp)
+        return -EBADF;
+
+    BufferArg eventsBuf(events_ptr, maxevents * sizeof(struct epoll_event));
+    auto *events =
+        reinterpret_cast<struct epoll_event *>(eventsBuf.bufferPtr());
+
+    /*
+     * Do not let a host epoll_wait block the whole gem5 process for an
+     * unbounded target timeout. A short host wait still lets external socket
+     * events wake SE workloads while keeping timer/CXL polling loops moving.
+     */
+    int host_timeout = timeout == 0 ? 0 : 1;
+    int status =
+        epoll_wait(epfdp->getSimFD(), events, maxevents, host_timeout);
+    if (status == -1)
+        return -errno;
+
+    if (status > 0)
+        eventsBuf.copyOut(SETranslatingPortProxy(tc));
+    return status;
+#else
+    warnUnsupportedOS("epoll_wait");
     return -1;
 #endif
 }

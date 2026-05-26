@@ -30,6 +30,7 @@
 
 #include <cctype>
 #include <functional>
+#include <memory>
 
 #include "base/logging.hh"
 #include "mem/packet.hh"
@@ -99,6 +100,7 @@ DsmTeeController::DsmTeeController(const DsmTeeControllerParams &p)
       permCacheHitLatency(p.perm_cache_hit_latency),
       permCacheMissLatency(p.perm_cache_miss_latency),
       metadataReadLatency(p.metadata_read_latency),
+      metadataReadPackets(p.metadata_read_packets),
       ideReqCycles(p.ide_req_cycles), ideRespCycles(p.ide_resp_cycles),
       ideReqDelay(p.ide_req_delay), ideRespDelay(p.ide_resp_delay),
       encryptReadDelay(p.encrypt_read_delay),
@@ -160,6 +162,10 @@ DsmTeeController::parseCpuVmid(const std::string &requestor_name,
          pos != std::string::npos;
          pos = requestor_name.find("cpu", pos + 3)) {
         std::size_t digit = pos + 3;
+        if (digit < requestor_name.size() &&
+            requestor_name[digit] == 's') {
+            digit++;
+        }
         if (digit >= requestor_name.size() ||
             !std::isdigit(static_cast<unsigned char>(requestor_name[digit]))) {
             continue;
@@ -279,24 +285,30 @@ DsmTeeController::accessOverhead(PacketPtr pkt) const
     return delay;
 }
 
-Tick
-DsmTeeController::delayReq(PacketPtr pkt)
+DsmTeeController::PermissionLookup
+DsmTeeController::permissionLookup(PacketPtr pkt,
+                                   bool resolve_metadata_miss)
 {
+    PermissionLookup result;
+
     const uint8_t perm = permissionForRequest(pkt);
     if (perm == 0)
-        return 0;
+        return result;
 
     const Addr paddr = pkt->getAddr();
+    result.paddr = paddr;
+    result.perm = perm;
+
     const uint64_t rid = driver->regionIdForPaddr(paddr);
     if (rid == 0) {
         stats.nonDsmRequests++;
         if (bypassNonDsm)
-            return 0;
+            return result;
     } else {
         stats.dsmRequests++;
     }
 
-    Tick delay = accessOverhead(pkt);
+    result.delay = accessOverhead(pkt);
     if (pkt->isRead()) {
         stats.bytesRead += pkt->getSize();
     }
@@ -309,19 +321,19 @@ DsmTeeController::delayReq(PacketPtr pkt)
         stats.unmappedRequestors++;
         if (pkt->isWriteback())
             stats.writebackBypass++;
-        stats.totalReqDelay += delay;
-        return delay;
+        return result;
     }
+    result.vmid = vmid;
 
     stats.permissionChecks++;
 
-    delay += cyclesToTicks(permCheckCycles);
-    delay += cyclesToTicks(permCacheAccessCycles);
+    result.delay += cyclesToTicks(permCheckCycles);
+    result.delay += cyclesToTicks(permCacheAccessCycles);
 
     bool permitted = false;
     if (hasCachedPermission(paddr, vmid, perm)) {
         stats.permissionCacheHits++;
-        delay += permCacheHitLatency;
+        result.delay += permCacheHitLatency;
         permitted = true;
     } else {
         stats.permissionCacheMisses++;
@@ -331,13 +343,21 @@ DsmTeeController::delayReq(PacketPtr pkt)
                  name(), paddr, vmid);
         stats.metadataReads++;
         stats.metadataReadBytes += DsmTeeMemoryDriver::MetadataCacheLineBytes;
-        delay += metadataReadLatency;
-        delay += permCacheMissLatency;
-        permitted = driver->hasAccess(paddr, vmid, perm);
-        if (permitted)
-            insertPermissionCache(paddr, vmid, perm);
+        result.metadataMiss = true;
+        result.metadataPaddr = metadata_paddr;
+        if (resolve_metadata_miss) {
+            result.delay += metadataReadLatency;
+            result.delay += permCacheMissLatency;
+            permitted = driver->hasAccess(paddr, vmid, perm);
+            if (permitted)
+                insertPermissionCache(paddr, vmid, perm);
+        } else {
+            result.permitted = true;
+            return result;
+        }
     }
 
+    result.permitted = permitted;
     if (!permitted) {
         stats.permissionDenied++;
         handlePermissionDenied(pkt, vmid, perm);
@@ -350,8 +370,105 @@ DsmTeeController::delayReq(PacketPtr pkt)
             stats.execPermitted++;
     }
 
-    stats.totalReqDelay += delay;
-    return delay;
+    return result;
+}
+
+Tick
+DsmTeeController::delayReq(PacketPtr pkt)
+{
+    const PermissionLookup lookup = permissionLookup(pkt, true);
+    stats.totalReqDelay += lookup.delay;
+    return lookup.delay;
+}
+
+PacketPtr
+DsmTeeController::makeMetadataReadPacket(
+        PacketPtr data_pkt, const PermissionLookup &lookup) const
+{
+    Request::Flags flags;
+    if (data_pkt->isSecure())
+        flags.set(Request::SECURE);
+
+    auto req = std::make_shared<Request>(
+            lookup.metadataPaddr,
+            DsmTeeMemoryDriver::MetadataCacheLineBytes,
+            flags,
+            data_pkt->requestorId());
+    PacketPtr metadata_pkt = Packet::createRead(req);
+    metadata_pkt->allocate();
+    metadata_pkt->pushSenderState(new MetadataReadSenderState(
+            data_pkt, lookup.paddr, lookup.vmid, lookup.perm));
+    return metadata_pkt;
+}
+
+bool
+DsmTeeController::recvTimingReq(PacketPtr pkt, Tick receive_delay)
+{
+    if (!metadataReadPackets)
+        return MemDelay::recvTimingReq(pkt, receive_delay);
+
+    const PermissionLookup lookup = permissionLookup(pkt, false);
+    stats.totalReqDelay += lookup.delay;
+
+    if (!lookup.metadataMiss) {
+        requestPort.schedTimingReq(pkt, curTick() + receive_delay +
+                                   lookup.delay);
+        return true;
+    }
+
+    PacketPtr metadata_pkt = makeMetadataReadPacket(pkt, lookup);
+    requestPort.schedTimingReq(metadata_pkt, curTick() + receive_delay +
+                               lookup.delay);
+    return true;
+}
+
+void
+DsmTeeController::finishMetadataRead(PacketPtr metadata_pkt,
+                                     Tick receive_delay,
+                                     MetadataReadSenderState *state)
+{
+    PacketPtr blocked_pkt = state->blockedPkt;
+    const Addr paddr = state->dataPaddr;
+    const uint32_t vmid = state->vmid;
+    const uint8_t perm = state->perm;
+
+    bool permitted = driver->hasAccess(paddr, vmid, perm);
+    if (permitted) {
+        insertPermissionCache(paddr, vmid, perm);
+    } else {
+        stats.permissionDenied++;
+        handlePermissionDenied(blocked_pkt, vmid, perm);
+    }
+
+    if (permitted) {
+        if (perm & DsmTeeMemoryDriver::PermRead)
+            stats.readPermitted++;
+        if (perm & DsmTeeMemoryDriver::PermWrite)
+            stats.writePermitted++;
+        if (perm & DsmTeeMemoryDriver::PermExec)
+            stats.execPermitted++;
+    }
+
+    stats.totalReqDelay += permCacheMissLatency;
+
+    delete metadata_pkt->popSenderState();
+    delete metadata_pkt;
+
+    requestPort.schedTimingReq(blocked_pkt, curTick() + receive_delay +
+                               permCacheMissLatency);
+}
+
+bool
+DsmTeeController::recvTimingResp(PacketPtr pkt, Tick receive_delay)
+{
+    auto *metadata_state =
+        dynamic_cast<MetadataReadSenderState *>(pkt->senderState);
+    if (metadata_state) {
+        finishMetadataRead(pkt, receive_delay, metadata_state);
+        return true;
+    }
+
+    return MemDelay::recvTimingResp(pkt, receive_delay);
 }
 
 Tick

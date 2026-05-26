@@ -31,6 +31,9 @@
 
 #include <sys/types.h>
 
+#include <map>
+#include <utility>
+
 #include "params/CxlMemoryDriver.hh"
 #include "sim/emul_driver.hh"
 
@@ -48,7 +51,10 @@ class CxlMemoryDriver : public EmulatedDriver
               int tgt_flags, int tgt_fd, off_t offset) override;
 
   private:
+    Addr getOrCreateBacking(ThreadContext *tc, off_t offset, uint64_t length);
+
     const int memoryPoolId;
+    std::map<std::pair<off_t, uint64_t>, Addr> sharedBackings;
 };
 
 } // namespace gem5

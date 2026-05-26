@@ -37,6 +37,7 @@
 #include "base/statistics.hh"
 #include "base/types.hh"
 #include "mem/mem_delay.hh"
+#include "mem/packet.hh"
 #include "params/DsmTeeController.hh"
 
 namespace gem5
@@ -51,10 +52,23 @@ class DsmTeeController : public MemDelay
     DsmTeeController(const DsmTeeControllerParams &p);
 
   protected:
+    bool recvTimingReq(PacketPtr pkt, Tick receive_delay) override;
+    bool recvTimingResp(PacketPtr pkt, Tick receive_delay) override;
     Tick delayReq(PacketPtr pkt) override;
     Tick delayResp(PacketPtr pkt) override;
 
   private:
+    struct PermissionLookup
+    {
+        Tick delay = 0;
+        Addr paddr = 0;
+        Addr metadataPaddr = 0;
+        uint32_t vmid = 0;
+        uint8_t perm = 0;
+        bool metadataMiss = false;
+        bool permitted = true;
+    };
+
     struct PermissionCacheKey
     {
         Addr pageBase = 0;
@@ -72,6 +86,21 @@ class DsmTeeController : public MemDelay
     struct PermissionCacheEntry
     {
         std::list<PermissionCacheKey>::iterator lruIt;
+    };
+
+    struct MetadataReadSenderState : public Packet::SenderState
+    {
+        PacketPtr blockedPkt = nullptr;
+        Addr dataPaddr = 0;
+        uint32_t vmid = 0;
+        uint8_t perm = 0;
+
+        MetadataReadSenderState(PacketPtr pkt, Addr paddr, uint32_t req_vmid,
+                                uint8_t req_perm)
+            : blockedPkt(pkt), dataPaddr(paddr), vmid(req_vmid),
+              perm(req_perm)
+        {
+        }
     };
 
     struct DsmTeeControllerStats : public statistics::Group
@@ -108,6 +137,7 @@ class DsmTeeController : public MemDelay
     const Tick permCacheHitLatency;
     const Tick permCacheMissLatency;
     const Tick metadataReadLatency;
+    const bool metadataReadPackets;
     const Cycles ideReqCycles;
     const Cycles ideRespCycles;
     const Tick ideReqDelay;
@@ -133,6 +163,12 @@ class DsmTeeController : public MemDelay
     void handlePermissionDenied(PacketPtr pkt, uint32_t vmid,
                                 uint8_t perm) const;
     Tick accessOverhead(PacketPtr pkt) const;
+    PermissionLookup permissionLookup(PacketPtr pkt,
+                                      bool resolve_metadata_miss);
+    PacketPtr makeMetadataReadPacket(PacketPtr data_pkt,
+                                     const PermissionLookup &lookup) const;
+    void finishMetadataRead(PacketPtr metadata_pkt, Tick receive_delay,
+                            MetadataReadSenderState *state);
 };
 
 } // namespace gem5

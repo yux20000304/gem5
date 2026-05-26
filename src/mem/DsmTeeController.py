@@ -57,6 +57,11 @@ class DsmTeeController(MemDelay):
     metadata_read_latency = Param.Latency(
         "150ns", "Latency to read DSM-TEE permission metadata from CXL memory"
     )
+    metadata_read_packets = Param.Bool(
+        True,
+        "Issue real metadata read packets on permission cache misses. "
+        "Disable to use metadata_read_latency as a fixed timing-only delay.",
+    )
 
     ide_req_delay = Param.Latency(
         "0ns", "Additional DSM-TEE IDE/MAC delay on CXL requests"

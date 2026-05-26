@@ -31,12 +31,14 @@
 #include <cerrno>
 #include <memory>
 
+#include "base/intmath.hh"
 #include "base/logging.hh"
 #include "cpu/thread_context.hh"
 #include "sim/fd_array.hh"
 #include "sim/fd_entry.hh"
 #include "sim/mem_state.hh"
 #include "sim/process.hh"
+#include "sim/se_workload.hh"
 
 namespace gem5
 {
@@ -63,6 +65,23 @@ CxlMemoryDriver::ioctl(ThreadContext *tc, unsigned req, Addr buf)
 }
 
 Addr
+CxlMemoryDriver::getOrCreateBacking(ThreadContext *tc, off_t offset,
+                                    uint64_t length)
+{
+    const auto key = std::make_pair(offset, length);
+    auto it = sharedBackings.find(key);
+    if (it != sharedBackings.end())
+        return it->second;
+
+    auto process = tc->getProcessPtr();
+    const Addr page_bytes = process->pTable->pageSize();
+    const int npages = divCeil(length, page_bytes);
+    Addr phys_base = process->seWorkload->allocPhysPages(npages, memoryPoolId);
+    sharedBackings.emplace(key, phys_base);
+    return phys_base;
+}
+
+Addr
 CxlMemoryDriver::mmap(ThreadContext *tc, Addr start, uint64_t length,
                       int prot, int tgt_flags, int tgt_fd, off_t offset)
 {
@@ -75,8 +94,9 @@ CxlMemoryDriver::mmap(ThreadContext *tc, Addr start, uint64_t length,
     if (!start)
         start = mem_state->extendMmap(length);
 
+    Addr phys_base = getOrCreateBacking(tc, offset, length);
     mem_state->mapRegion(start, length, "/dev/" + filename, -1, offset,
-                         memoryPoolId);
+                         memoryPoolId, phys_base, false);
 
     return start;
 }

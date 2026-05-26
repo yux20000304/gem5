@@ -649,6 +649,13 @@ fcntlFunc(SyscallDesc *desc, ThreadContext *tc,
       case F_SETFL: {
         int arg = varargs.get<int>();
         int rv = fcntl(sim_fd, cmd, arg);
+        if (rv != -1) {
+            if (cmd == F_SETFL) {
+                hbfdp->setFlags(arg);
+            } else {
+                hbfdp->setFlags(rv);
+            }
+        }
         return (rv == -1) ? -errno : rv;
       }
 
