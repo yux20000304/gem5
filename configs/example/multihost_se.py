@@ -284,6 +284,16 @@ parser.add_argument(
     help="After dumping ROI stats, continue executing the workload.",
 )
 parser.add_argument(
+    "--roi-maxinsts",
+    type=int,
+    default=0,
+    help=(
+        "After m5_work_begin, simulate at most this many committed "
+        "instructions on any ROI CPU thread. 0 disables the ROI instruction "
+        "limit. Requires --fast-forward-to-roi."
+    ),
+)
+parser.add_argument(
     "--mem",
     choices=["simple", "ddr3", "ddr5-4400", "ddr5-6400"],
     default="ddr5-6400",
@@ -517,6 +527,11 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+if args.roi_maxinsts < 0:
+    raise ValueError("--roi-maxinsts must be >= 0")
+if args.roi_maxinsts and not args.fast_forward_to_roi:
+    raise ValueError("--roi-maxinsts requires --fast-forward-to-roi")
 
 host_core_counts = parse_csv_list(args.host_cores, "--host-cores", int)
 if any(count <= 0 for count in host_core_counts):
@@ -816,7 +831,8 @@ print(f"  mode: {args.mode}")
 print(
     "  cpu: "
     f"startup={'atomic' if using_atomic_cpu else args.cpu}, "
-    f"roi={args.cpu}, fast_forward_to_roi={args.fast_forward_to_roi}"
+    f"roi={args.cpu}, fast_forward_to_roi={args.fast_forward_to_roi}, "
+    f"roi_maxinsts={args.roi_maxinsts}"
 )
 print(f"  hosts: {num_hosts}")
 print(f"  total cores: {total_cores}")
@@ -878,6 +894,7 @@ else:
 if args.fast_forward_to_roi:
     print("Fast-forward to ROI: waiting for m5_work_begin")
     switched_to_roi = False
+    roi_maxinsts_scheduled = False
     exit_event = None
 
     while True:
@@ -895,11 +912,24 @@ if args.fast_forward_to_roi:
             print("ROI caches writeback+invalidate")
             m5.stats.reset()
             print("ROI stats reset")
+            if args.roi_maxinsts and not roi_maxinsts_scheduled:
+                for cpu in system.switch_cpus:
+                    cpu.scheduleInstStopAnyThread(args.roi_maxinsts)
+                roi_maxinsts_scheduled = True
+                print(
+                    "ROI max instruction limit scheduled: "
+                    f"{args.roi_maxinsts} committed instructions per CPU "
+                    "thread, any thread exits"
+                )
         elif cause == "workend":
             m5.stats.dump()
             print("ROI stats dumped")
             if args.roi_exit_after_workend:
                 break
+        elif cause == "a thread reached the max instruction count":
+            m5.stats.dump()
+            print("ROI maxinst stats dumped")
+            break
         else:
             if not switched_to_roi:
                 print("Warning: workload exited before emitting m5_work_begin")

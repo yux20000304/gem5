@@ -379,6 +379,8 @@ def build_job(args, benchmark, variant, host_count):
     ]
     if args.fast_forward_to_roi:
         cmd.append("--fast-forward-to-roi")
+        if args.roi_maxinsts:
+            cmd.append(f"--roi-maxinsts={args.roi_maxinsts}")
         if args.roi_continue_after_workend:
             cmd.append("--roi-continue-after-workend")
 
@@ -466,6 +468,7 @@ def build_job(args, benchmark, variant, host_count):
         "host_cores": host_cores,
         "cpu_clock": args.cpu_clock,
         "fast_forward_to_roi": args.fast_forward_to_roi,
+        "roi_maxinsts": args.roi_maxinsts,
         "label": label,
         "out_dir": out_dir,
         "m5out": m5out,
@@ -512,6 +515,7 @@ def summarize_job(job, status, returncode=None, wall_seconds=None):
         "threads": job["threads"],
         "host_cores": job["host_cores"],
         "fast_forward_to_roi": job["fast_forward_to_roi"],
+        "roi_maxinsts": job["roi_maxinsts"],
         "label": job["label"],
         "out_dir": str(job["out_dir"]),
         "workload_cmd": job["workload_cmd"],
@@ -611,6 +615,7 @@ def write_aggregate(args, jobs):
                 "host_count": job["host_count"],
                 "threads": job["threads"],
                 "fast_forward_to_roi": job["fast_forward_to_roi"],
+                "roi_maxinsts": job["roi_maxinsts"],
                 "label": job["label"],
                 "out_dir": str(job["out_dir"]),
             }
@@ -626,6 +631,7 @@ def write_aggregate(args, jobs):
         "cores_per_host",
         "threads",
         "fast_forward_to_roi",
+        "roi_maxinsts",
         "sim_cycles",
         "max_cpu_cycles",
         "cxl_mem_reads",
@@ -874,6 +880,15 @@ def parse_args():
         help="Continue the workload after dumping ROI stats instead of exiting at m5_work_end.",
     )
     parser.add_argument(
+        "--roi-maxinsts",
+        type=int,
+        default=0,
+        help=(
+            "When used with --fast-forward-to-roi, stop after any ROI CPU "
+            "thread commits this many instructions. 0 disables the limit."
+        ),
+    )
+    parser.add_argument(
         "--mem",
         choices=["simple", "ddr3", "ddr5-4400", "ddr5-6400"],
         default="ddr5-6400",
@@ -983,6 +998,10 @@ def parse_args():
         raise ValueError("--cores-per-host must be positive")
     if any(hosts <= 0 for hosts in args.host_counts):
         raise ValueError("--host-counts must be positive")
+    if args.roi_maxinsts < 0:
+        raise ValueError("--roi-maxinsts must be >= 0")
+    if args.roi_maxinsts and not args.fast_forward_to_roi:
+        raise ValueError("--roi-maxinsts requires --fast-forward-to-roi")
 
     args.result_root.mkdir(parents=True, exist_ok=True)
     args.cxl_mem_margin_bytes = parse_size_to_bytes(args.cxl_mem_margin)
@@ -1030,6 +1049,7 @@ def main():
                 "host_count",
                 "threads",
                 "fast_forward_to_roi",
+                "roi_maxinsts",
                 "host_mem",
                 "cxl_region",
                 "cxl_mem",
@@ -1047,6 +1067,7 @@ def main():
                     job["host_count"],
                     job["threads"],
                     job["fast_forward_to_roi"],
+                    job["roi_maxinsts"],
                     format_gem5_size(job["host_mem_bytes"]),
                     format_gem5_size(job["cxl_region_bytes"]),
                     format_gem5_size(job["cxl_mem_bytes"]),
