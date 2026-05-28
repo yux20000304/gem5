@@ -89,6 +89,7 @@ PAPER_CXL_BANDWIDTH = "25.6GB/s"
 
 
 CPU_TYPES = {
+    "atomic": X86AtomicSimpleCPU,
     "timing": X86TimingSimpleCPU,
     "o3": X86O3CPU,
 }
@@ -259,7 +260,7 @@ parser.add_argument(
     "--cpu",
     choices=CPU_TYPES,
     default="timing",
-    help="Detailed ROI CPU model. Atomic is only used internally by --fast-forward-to-roi.",
+    help="CPU model. Use atomic only for functional smoke tests or fast setup.",
 )
 parser.add_argument(
     "--fast-forward-to-roi",
@@ -621,6 +622,7 @@ detailed_cpu_cls = CPU_TYPES[args.cpu]
 startup_cpu_cls = (
     X86AtomicSimpleCPU if args.fast_forward_to_roi else detailed_cpu_cls
 )
+using_atomic_cpu = args.fast_forward_to_roi or args.cpu == "atomic"
 
 core_to_host = []
 for host_id, count in enumerate(host_core_counts):
@@ -633,7 +635,7 @@ cpus = [
 
 system = System(
     cpu=cpus,
-    mem_mode="atomic" if args.fast_forward_to_roi else "timing",
+    mem_mode="atomic" if using_atomic_cpu else "timing",
     mem_ranges=[],
 )
 system.exit_on_work_items = args.fast_forward_to_roi
@@ -813,7 +815,7 @@ print("Pseudo multi-host SE topology")
 print(f"  mode: {args.mode}")
 print(
     "  cpu: "
-    f"startup={'atomic' if args.fast_forward_to_roi else args.cpu}, "
+    f"startup={'atomic' if using_atomic_cpu else args.cpu}, "
     f"roi={args.cpu}, fast_forward_to_roi={args.fast_forward_to_roi}"
 )
 print(f"  hosts: {num_hosts}")

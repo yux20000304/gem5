@@ -685,7 +685,10 @@ def write_aggregate(args, jobs):
         {(row["benchmark"], int(row["host_count"])) for row in completed}
     )
     variants = list(args.variants)
-    xlabels = [f"{bench}\\nh{hosts}" for bench, hosts in groups]
+    xlabels = [
+        bench.replace("\\n", "\n").replace("/n", "\n") + f"\nh{hosts}"
+        for bench, hosts in groups
+    ]
     x = list(range(len(groups)))
     width = 0.8 / max(1, len(variants))
 

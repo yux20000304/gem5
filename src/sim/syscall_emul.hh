@@ -2953,9 +2953,12 @@ readFunc(SyscallDesc *desc, ThreadContext *tc,
     struct pollfd pfd;
     pfd.fd = sim_fd;
     pfd.events = POLLIN | POLLPRI;
-    if ((poll(&pfd, 1, 0) == 0)
-        && !(hbfdp->getFlags() & OS::TGT_O_NONBLOCK))
-        return SyscallReturn::retry();
+    if (poll(&pfd, 1, 0) == 0) {
+        if (std::dynamic_pointer_cast<SocketFDEntry>(hbfdp))
+            return -EAGAIN;
+        if (!(hbfdp->getFlags() & OS::TGT_O_NONBLOCK))
+            return SyscallReturn::retry();
+    }
 
     BufferArg buf_arg(buf_ptr, nbytes);
     int bytes_read = read(sim_fd, buf_arg.bufferPtr(), nbytes);
