@@ -58,6 +58,12 @@ class DsmTeeController : public MemDelay
     Tick delayResp(PacketPtr pkt) override;
 
   private:
+    enum class MetadataReadKind
+    {
+        DataPath,
+        TlbMiss,
+    };
+
     struct PermissionLookup
     {
         Tick delay = 0;
@@ -65,6 +71,7 @@ class DsmTeeController : public MemDelay
         Addr metadataPaddr = 0;
         uint32_t vmid = 0;
         uint8_t perm = 0;
+        MetadataReadKind metadataKind = MetadataReadKind::DataPath;
         bool metadataMiss = false;
         bool permitted = true;
     };
@@ -94,11 +101,12 @@ class DsmTeeController : public MemDelay
         Addr dataPaddr = 0;
         uint32_t vmid = 0;
         uint8_t perm = 0;
+        MetadataReadKind kind = MetadataReadKind::DataPath;
 
         MetadataReadSenderState(PacketPtr pkt, Addr paddr, uint32_t req_vmid,
-                                uint8_t req_perm)
+                                uint8_t req_perm, MetadataReadKind req_kind)
             : blockedPkt(pkt), dataPaddr(paddr), vmid(req_vmid),
-              perm(req_perm)
+              perm(req_perm), kind(req_kind)
         {
         }
     };
@@ -114,6 +122,9 @@ class DsmTeeController : public MemDelay
         statistics::Scalar permissionCacheMisses;
         statistics::Scalar permissionCacheInvalidations;
         statistics::Scalar permissionDenied;
+        statistics::Scalar tlbMissPermissionChecks;
+        statistics::Scalar tlbMissMetadataReads;
+        statistics::Scalar tlbMissMetadataReadBytes;
         statistics::Scalar metadataReads;
         statistics::Scalar metadataReadBytes;
         statistics::Scalar unmappedRequestors;
@@ -125,6 +136,7 @@ class DsmTeeController : public MemDelay
         statistics::Scalar writeResponses;
         statistics::Scalar bytesRead;
         statistics::Scalar bytesWritten;
+        statistics::Scalar tlbMissPermissionCheckDelay;
         statistics::Scalar totalReqDelay;
         statistics::Scalar totalRespDelay;
     } stats;
@@ -162,9 +174,15 @@ class DsmTeeController : public MemDelay
     void insertPermissionCache(Addr paddr, uint32_t vmid, uint8_t perm);
     void handlePermissionDenied(PacketPtr pkt, uint32_t vmid,
                                 uint8_t perm) const;
+    void accountPermissionGranted(uint8_t perm);
     Tick accessOverhead(PacketPtr pkt) const;
+    PermissionLookup checkPermission(PacketPtr pkt, Addr paddr,
+                                     uint32_t vmid, uint8_t perm,
+                                     bool resolve_metadata_miss,
+                                     MetadataReadKind kind);
     PermissionLookup permissionLookup(PacketPtr pkt,
-                                      bool resolve_metadata_miss);
+                                      bool resolve_metadata_miss,
+                                      bool include_tlb_miss = true);
     PacketPtr makeMetadataReadPacket(PacketPtr data_pkt,
                                      const PermissionLookup &lookup) const;
     void finishMetadataRead(PacketPtr metadata_pkt, Tick receive_delay,

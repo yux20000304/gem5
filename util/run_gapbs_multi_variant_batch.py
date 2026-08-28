@@ -377,6 +377,8 @@ def build_job(args, benchmark, variant, host_count):
         f"--sys-clock={args.sys_clock}",
         f"--cpu-clock={args.cpu_clock}",
     ]
+    cmd.append(f"--progress-interval-insts={args.progress_interval_insts}")
+    cmd.append(f"--progress-scope={args.progress_scope}")
     if args.fast_forward_to_roi:
         cmd.append("--fast-forward-to-roi")
         if args.roi_maxinsts:
@@ -469,6 +471,8 @@ def build_job(args, benchmark, variant, host_count):
         "cpu_clock": args.cpu_clock,
         "fast_forward_to_roi": args.fast_forward_to_roi,
         "roi_maxinsts": args.roi_maxinsts,
+        "progress_interval_insts": args.progress_interval_insts,
+        "progress_scope": args.progress_scope,
         "label": label,
         "out_dir": out_dir,
         "m5out": m5out,
@@ -516,6 +520,8 @@ def summarize_job(job, status, returncode=None, wall_seconds=None):
         "host_cores": job["host_cores"],
         "fast_forward_to_roi": job["fast_forward_to_roi"],
         "roi_maxinsts": job["roi_maxinsts"],
+        "progress_interval_insts": job["progress_interval_insts"],
+        "progress_scope": job["progress_scope"],
         "label": job["label"],
         "out_dir": str(job["out_dir"]),
         "workload_cmd": job["workload_cmd"],
@@ -568,6 +574,18 @@ def summarize_job(job, status, returncode=None, wall_seconds=None):
         "permission_cache_misses": stat(
             stats, "system.dsm_tee_ctrl.permissionCacheMisses", ""
         ),
+        "tlb_miss_permission_checks": stat(
+            stats, "system.dsm_tee_ctrl.tlbMissPermissionChecks", ""
+        ),
+        "tlb_miss_permission_check_delay": stat(
+            stats, "system.dsm_tee_ctrl.tlbMissPermissionCheckDelay", ""
+        ),
+        "tlb_miss_metadata_reads": stat(
+            stats, "system.dsm_tee_ctrl.tlbMissMetadataReads", ""
+        ),
+        "tlb_miss_metadata_read_bytes": stat(
+            stats, "system.dsm_tee_ctrl.tlbMissMetadataReadBytes", ""
+        ),
         "metadata_reads": stat(stats, "system.dsm_tee_ctrl.metadataReads", ""),
         "metadata_read_bytes": stat(
             stats, "system.dsm_tee_ctrl.metadataReadBytes", ""
@@ -616,6 +634,8 @@ def write_aggregate(args, jobs):
                 "threads": job["threads"],
                 "fast_forward_to_roi": job["fast_forward_to_roi"],
                 "roi_maxinsts": job["roi_maxinsts"],
+                "progress_interval_insts": job["progress_interval_insts"],
+                "progress_scope": job["progress_scope"],
                 "label": job["label"],
                 "out_dir": str(job["out_dir"]),
             }
@@ -632,12 +652,18 @@ def write_aggregate(args, jobs):
         "threads",
         "fast_forward_to_roi",
         "roi_maxinsts",
+        "progress_interval_insts",
+        "progress_scope",
         "sim_cycles",
         "max_cpu_cycles",
         "cxl_mem_reads",
         "cxl_mem_bytes_read",
         "permission_checks",
         "permission_cache_misses",
+        "tlb_miss_permission_checks",
+        "tlb_miss_permission_check_delay",
+        "tlb_miss_metadata_reads",
+        "tlb_miss_metadata_read_bytes",
         "metadata_reads",
         "metadata_read_bytes",
         "graph_nodes",
@@ -864,7 +890,7 @@ def parse_args():
     parser.add_argument("--native-gapbs-args", default="")
     parser.add_argument("--cxl-gapbs-args", default="")
     parser.add_argument("--dsmtee-gapbs-args", default="")
-    parser.add_argument("--cpu", choices=["timing", "o3"], default="timing")
+    parser.add_argument("--cpu", choices=["timing", "o3"], default="o3")
     parser.add_argument(
         "--fast-forward-to-roi",
         action="store_true",
@@ -886,6 +912,26 @@ def parse_args():
         help=(
             "When used with --fast-forward-to-roi, stop after any ROI CPU "
             "thread commits this many instructions. 0 disables the limit."
+        ),
+    )
+    parser.add_argument(
+        "--progress-interval-insts",
+        type=int,
+        default=100_000_000,
+        help=(
+            "Forward progress heartbeat interval to multihost_se.py. "
+            "Every N committed instructions per CPU thread, gem5 prints one "
+            "line and continues automatically. 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--progress-scope",
+        choices=["roi", "all"],
+        default="roi",
+        help=(
+            "Forward progress scope to multihost_se.py. roi prints only "
+            "after GAPBS enters m5_work_begin; all also prints during "
+            "fast-forward graph construction."
         ),
     )
     parser.add_argument(
@@ -1002,6 +1048,8 @@ def parse_args():
         raise ValueError("--roi-maxinsts must be >= 0")
     if args.roi_maxinsts and not args.fast_forward_to_roi:
         raise ValueError("--roi-maxinsts requires --fast-forward-to-roi")
+    if args.progress_interval_insts < 0:
+        raise ValueError("--progress-interval-insts must be >= 0")
 
     args.result_root.mkdir(parents=True, exist_ok=True)
     args.cxl_mem_margin_bytes = parse_size_to_bytes(args.cxl_mem_margin)
@@ -1050,6 +1098,8 @@ def main():
                 "threads",
                 "fast_forward_to_roi",
                 "roi_maxinsts",
+                "progress_interval_insts",
+                "progress_scope",
                 "host_mem",
                 "cxl_region",
                 "cxl_mem",
@@ -1068,6 +1118,8 @@ def main():
                     job["threads"],
                     job["fast_forward_to_roi"],
                     job["roi_maxinsts"],
+                    job["progress_interval_insts"],
+                    job["progress_scope"],
                     format_gem5_size(job["host_mem_bytes"]),
                     format_gem5_size(job["cxl_region_bytes"]),
                     format_gem5_size(job["cxl_mem_bytes"]),

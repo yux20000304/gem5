@@ -765,6 +765,34 @@ def write_outputs(args, out_dir, workload_cmd, results):
     )
     row(
         rows,
+        "tlb_miss_permission_checks",
+        0 if baseline else "",
+        dstat("system.dsm_tee_ctrl.tlbMissPermissionChecks"),
+        "count",
+    )
+    row(
+        rows,
+        "tlb_miss_permission_check_delay",
+        0 if baseline else "",
+        dstat("system.dsm_tee_ctrl.tlbMissPermissionCheckDelay"),
+        "tick",
+    )
+    row(
+        rows,
+        "tlb_miss_metadata_reads",
+        0 if baseline else "",
+        dstat("system.dsm_tee_ctrl.tlbMissMetadataReads"),
+        "count",
+    )
+    row(
+        rows,
+        "tlb_miss_metadata_read_bytes",
+        0 if baseline else "",
+        dstat("system.dsm_tee_ctrl.tlbMissMetadataReadBytes"),
+        "byte",
+    )
+    row(
+        rows,
         "permission_denied",
         0 if baseline else "",
         dstat("system.dsm_tee_ctrl.permissionDenied"),
@@ -974,7 +1002,7 @@ def parse_args():
         choices=["cross-host-threaded", "per-host-process"],
         default="cross-host-threaded",
     )
-    parser.add_argument("--cpu", choices=["timing", "o3"], default="timing")
+    parser.add_argument("--cpu", choices=["timing", "o3"], default="o3")
     parser.add_argument(
         "--mem",
         choices=["simple", "ddr3", "ddr5-4400", "ddr5-6400"],

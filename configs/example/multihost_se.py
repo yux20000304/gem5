@@ -86,6 +86,8 @@ class FastSimpleMemory(SimpleMemory):
 PAPER_CXL_DDR5_READ_LATENCY = "42ns"
 PAPER_CXL_LINK_ONE_WAY_DELAY = "35ns"
 PAPER_CXL_BANDWIDTH = "25.6GB/s"
+DEFAULT_PROGRESS_INTERVAL_INSTS = 100_000_000
+PROGRESS_EXIT_CAUSE = "gem5 progress instruction interval"
 
 
 CPU_TYPES = {
@@ -119,6 +121,103 @@ PAPER_DDR5_FACTORIES = {
     "ddr5-4400": make_paper_ddr5_4400,
     "ddr5-6400": make_paper_ddr5_6400,
 }
+
+
+class InstructionProgress:
+    def __init__(self, interval_insts, core_to_host):
+        self.interval_insts = interval_insts
+        self.core_to_host = core_to_host
+        self.active_cpus = []
+        self.phase = "main"
+        self.next_targets = {}
+        self.start_counts = {}
+        self.heartbeat_count = 0
+
+    def enabled(self):
+        return self.interval_insts > 0
+
+    def _thread_count(self, cpu):
+        return int(getattr(cpu, "numThreads", 1))
+
+    def _thread_key(self, cpu, tid):
+        return (id(cpu), tid)
+
+    def _cpu_label(self, cpu, cpu_index, tid):
+        try:
+            core_id = int(cpu.cpu_id)
+        except (AttributeError, TypeError, ValueError):
+            core_id = cpu_index
+        host_id = (
+            self.core_to_host[core_id]
+            if 0 <= core_id < len(self.core_to_host)
+            else "?"
+        )
+        return f"h{host_id}c{core_id}t{tid}"
+
+    def arm(self, cpus, phase):
+        if not self.enabled():
+            return
+        self.active_cpus = list(cpus)
+        self.phase = phase
+        self.next_targets = {}
+        self.start_counts = {}
+        for cpu_index, cpu in enumerate(self.active_cpus):
+            for tid in range(self._thread_count(cpu)):
+                current = int(cpu.getCurrentInstCount(tid))
+                key = self._thread_key(cpu, tid)
+                self.start_counts[key] = current
+                self.next_targets[key] = current + self.interval_insts
+                cpu.scheduleInstStop(
+                    tid, self.interval_insts, PROGRESS_EXIT_CAUSE
+                )
+        print(
+            "[gem5-progress] armed "
+            f"phase={self.phase} interval_insts={self.interval_insts} "
+            f"cpus={len(self.active_cpus)}",
+            flush=True,
+        )
+
+    def handle(self):
+        if not self.enabled():
+            return
+        self.heartbeat_count += 1
+        phase_committed = 0
+        reached = []
+
+        for cpu_index, cpu in enumerate(self.active_cpus):
+            for tid in range(self._thread_count(cpu)):
+                current = int(cpu.getCurrentInstCount(tid))
+                key = self._thread_key(cpu, tid)
+                start = self.start_counts.get(key, current)
+                phase_committed += max(0, current - start)
+                target = self.next_targets.get(key)
+                if target is None or current < target:
+                    continue
+
+                intervals = ((current - target) // self.interval_insts) + 1
+                reached_target = target + (intervals - 1) * self.interval_insts
+                next_target = target + intervals * self.interval_insts
+                self.next_targets[key] = next_target
+                delta = max(1, next_target - current)
+                cpu.scheduleInstStop(tid, delta, PROGRESS_EXIT_CAUSE)
+                label = self._cpu_label(cpu, cpu_index, tid)
+                reached.append(
+                    f"{label}:phase_insts={current - start},"
+                    f"target={reached_target - start}"
+                )
+
+        if reached:
+            reached_text = ";".join(reached)
+        else:
+            reached_text = "stale_progress_event"
+        print(
+            "[gem5-progress] "
+            f"event={self.heartbeat_count} phase={self.phase} "
+            f"tick={m5.curTick()} "
+            f"phase_committed_insts={phase_committed} "
+            f"reached={reached_text}",
+            flush=True,
+        )
 
 
 def parse_csv_list(raw, name, cast=str):
@@ -259,7 +358,7 @@ parser.add_argument(
 parser.add_argument(
     "--cpu",
     choices=CPU_TYPES,
-    default="timing",
+    default="o3",
     help="CPU model. Use atomic only for functional smoke tests or fast setup.",
 )
 parser.add_argument(
@@ -291,6 +390,26 @@ parser.add_argument(
         "After m5_work_begin, simulate at most this many committed "
         "instructions on any ROI CPU thread. 0 disables the ROI instruction "
         "limit. Requires --fast-forward-to-roi."
+    ),
+)
+parser.add_argument(
+    "--progress-interval-insts",
+    type=int,
+    default=DEFAULT_PROGRESS_INTERVAL_INSTS,
+    help=(
+        "Print a progress line every N committed instructions per CPU "
+        "thread and continue simulation automatically. 0 disables progress "
+        f"printing. Default: {DEFAULT_PROGRESS_INTERVAL_INSTS}."
+    ),
+)
+parser.add_argument(
+    "--progress-scope",
+    choices=["roi", "all"],
+    default="roi",
+    help=(
+        "Scope for instruction progress printing. roi prints only after "
+        "m5_work_begin when --fast-forward-to-roi is used. all also prints "
+        "during fast-forward or the whole non-ROI run."
     ),
 )
 parser.add_argument(
@@ -532,6 +651,8 @@ if args.roi_maxinsts < 0:
     raise ValueError("--roi-maxinsts must be >= 0")
 if args.roi_maxinsts and not args.fast_forward_to_roi:
     raise ValueError("--roi-maxinsts requires --fast-forward-to-roi")
+if args.progress_interval_insts < 0:
+    raise ValueError("--progress-interval-insts must be >= 0")
 
 host_core_counts = parse_csv_list(args.host_cores, "--host-cores", int)
 if any(count <= 0 for count in host_core_counts):
@@ -832,7 +953,9 @@ print(
     "  cpu: "
     f"startup={'atomic' if using_atomic_cpu else args.cpu}, "
     f"roi={args.cpu}, fast_forward_to_roi={args.fast_forward_to_roi}, "
-    f"roi_maxinsts={args.roi_maxinsts}"
+    f"roi_maxinsts={args.roi_maxinsts}, "
+    f"progress_interval_insts={args.progress_interval_insts}, "
+    f"progress_scope={args.progress_scope}"
 )
 print(f"  hosts: {num_hosts}")
 print(f"  total cores: {total_cores}")
@@ -891,8 +1014,12 @@ if cxl_range is not None:
 else:
     print("  cxl: disabled")
 
+progress = InstructionProgress(args.progress_interval_insts, core_to_host)
+
 if args.fast_forward_to_roi:
     print("Fast-forward to ROI: waiting for m5_work_begin")
+    if args.progress_scope == "all":
+        progress.arm(system.cpu, "fast-forward")
     switched_to_roi = False
     roi_maxinsts_scheduled = False
     exit_event = None
@@ -900,6 +1027,9 @@ if args.fast_forward_to_roi:
     while True:
         exit_event = m5.simulate()
         cause = exit_event.getCause()
+        if cause == PROGRESS_EXIT_CAUSE:
+            progress.handle()
+            continue
         print(f"Simulation event @ tick {m5.curTick()}: {cause}")
 
         if cause == "workbegin":
@@ -912,6 +1042,7 @@ if args.fast_forward_to_roi:
             print("ROI caches writeback+invalidate")
             m5.stats.reset()
             print("ROI stats reset")
+            progress.arm(system.switch_cpus, "roi")
             if args.roi_maxinsts and not roi_maxinsts_scheduled:
                 for cpu in system.switch_cpus:
                     cpu.scheduleInstStopAnyThread(args.roi_maxinsts)
@@ -935,7 +1066,16 @@ if args.fast_forward_to_roi:
                 print("Warning: workload exited before emitting m5_work_begin")
             break
 else:
-    exit_event = m5.simulate()
+    if args.progress_scope == "all":
+        progress.arm(system.cpu, "main")
+    while True:
+        exit_event = m5.simulate()
+        cause = exit_event.getCause()
+        if cause == PROGRESS_EXIT_CAUSE:
+            progress.handle()
+            continue
+        print(f"Simulation event @ tick {m5.curTick()}: {cause}")
+        break
 
 print(f"Exit tick: {m5.curTick()}")
 print(f"Exit cause: {exit_event.getCause()}")

@@ -60,6 +60,14 @@ DsmTeeController::DsmTeeControllerStats::DsmTeeControllerStats(
                "updates"),
       ADD_STAT(permissionDenied, statistics::units::Count::get(),
                "DSM-TEE data-path permission violations"),
+      ADD_STAT(tlbMissPermissionChecks, statistics::units::Count::get(),
+               "DSM-TEE permission checks caused by TLB misses targeting "
+               "protected regions"),
+      ADD_STAT(tlbMissMetadataReads, statistics::units::Count::get(),
+               "DSM-TEE permission metadata reads caused by TLB-miss "
+               "permission cache misses"),
+      ADD_STAT(tlbMissMetadataReadBytes, statistics::units::Byte::get(),
+               "DSM-TEE permission metadata bytes read for TLB-miss checks"),
       ADD_STAT(metadataReads, statistics::units::Count::get(),
                "DSM-TEE permission metadata reads from CXL memory"),
       ADD_STAT(metadataReadBytes, statistics::units::Byte::get(),
@@ -85,6 +93,8 @@ DsmTeeController::DsmTeeControllerStats::DsmTeeControllerStats(
                "Bytes read from DSM-TEE regions"),
       ADD_STAT(bytesWritten, statistics::units::Byte::get(),
                "Bytes written to DSM-TEE regions"),
+      ADD_STAT(tlbMissPermissionCheckDelay, statistics::units::Tick::get(),
+               "Total DSM-TEE local delay from TLB-miss permission checks"),
       ADD_STAT(totalReqDelay, statistics::units::Tick::get(),
                "Total request-side DSM-TEE delay"),
       ADD_STAT(totalRespDelay, statistics::units::Tick::get(),
@@ -158,9 +168,12 @@ bool
 DsmTeeController::parseCpuVmid(const std::string &requestor_name,
                                uint32_t &vmid) const
 {
+    bool saw_cpu_token = false;
+
     for (std::size_t pos = requestor_name.find("cpu");
          pos != std::string::npos;
          pos = requestor_name.find("cpu", pos + 3)) {
+        saw_cpu_token = true;
         std::size_t digit = pos + 3;
         if (digit < requestor_name.size() &&
             requestor_name[digit] == 's') {
@@ -183,6 +196,11 @@ DsmTeeController::parseCpuVmid(const std::string &requestor_name,
                  "%s maps requestor %s to VMID %llu, but num_vmids is %u",
                  name(), requestor_name, value, driver->numVmids());
         vmid = static_cast<uint32_t>(value);
+        return true;
+    }
+
+    if (saw_cpu_token && driver->numVmids() == 1) {
+        vmid = 0;
         return true;
     }
 
@@ -275,6 +293,17 @@ DsmTeeController::handlePermissionDenied(PacketPtr pkt, uint32_t vmid,
          name(), pkt->cmdString(), pkt->getAddr(), vmid, perm);
 }
 
+void
+DsmTeeController::accountPermissionGranted(uint8_t perm)
+{
+    if (perm & DsmTeeMemoryDriver::PermRead)
+        stats.readPermitted++;
+    if (perm & DsmTeeMemoryDriver::PermWrite)
+        stats.writePermitted++;
+    if (perm & DsmTeeMemoryDriver::PermExec)
+        stats.execPermitted++;
+}
+
 Tick
 DsmTeeController::accessOverhead(PacketPtr pkt) const
 {
@@ -286,8 +315,77 @@ DsmTeeController::accessOverhead(PacketPtr pkt) const
 }
 
 DsmTeeController::PermissionLookup
+DsmTeeController::checkPermission(PacketPtr pkt, Addr paddr,
+                                  uint32_t vmid, uint8_t perm,
+                                  bool resolve_metadata_miss,
+                                  MetadataReadKind kind)
+{
+    PermissionLookup result;
+    result.paddr = paddr;
+    result.vmid = vmid;
+    result.perm = perm;
+    result.metadataKind = kind;
+
+    const bool is_tlb_miss_check = kind == MetadataReadKind::TlbMiss;
+
+    stats.permissionChecks++;
+    if (is_tlb_miss_check)
+        stats.tlbMissPermissionChecks++;
+
+    const Tick local_check_delay =
+        cyclesToTicks(permCheckCycles) +
+        cyclesToTicks(permCacheAccessCycles);
+    result.delay += local_check_delay;
+    if (is_tlb_miss_check)
+        stats.tlbMissPermissionCheckDelay += local_check_delay;
+
+    bool permitted = false;
+    if (hasCachedPermission(paddr, vmid, perm)) {
+        stats.permissionCacheHits++;
+        result.delay += permCacheHitLatency;
+        permitted = true;
+    } else {
+        stats.permissionCacheMisses++;
+        const Addr metadata_paddr = driver->metadataPaddrFor(paddr, vmid);
+        fatal_if(metadata_paddr == 0,
+                 "%s could not locate DSM-TEE metadata for %#x VMID %u",
+                 name(), paddr, vmid);
+        stats.metadataReads++;
+        stats.metadataReadBytes += DsmTeeMemoryDriver::MetadataCacheLineBytes;
+        if (is_tlb_miss_check) {
+            stats.tlbMissMetadataReads++;
+            stats.tlbMissMetadataReadBytes +=
+                DsmTeeMemoryDriver::MetadataCacheLineBytes;
+        }
+        result.metadataMiss = true;
+        result.metadataPaddr = metadata_paddr;
+        if (resolve_metadata_miss) {
+            result.delay += metadataReadLatency;
+            result.delay += permCacheMissLatency;
+            permitted = driver->hasAccess(paddr, vmid, perm);
+            if (permitted)
+                insertPermissionCache(paddr, vmid, perm);
+        } else {
+            result.permitted = true;
+            return result;
+        }
+    }
+
+    result.permitted = permitted;
+    if (!permitted) {
+        stats.permissionDenied++;
+        handlePermissionDenied(pkt, vmid, perm);
+    } else {
+        accountPermissionGranted(perm);
+    }
+
+    return result;
+}
+
+DsmTeeController::PermissionLookup
 DsmTeeController::permissionLookup(PacketPtr pkt,
-                                   bool resolve_metadata_miss)
+                                   bool resolve_metadata_miss,
+                                   bool include_tlb_miss)
 {
     PermissionLookup result;
 
@@ -325,51 +423,34 @@ DsmTeeController::permissionLookup(PacketPtr pkt,
     }
     result.vmid = vmid;
 
-    stats.permissionChecks++;
-
-    result.delay += cyclesToTicks(permCheckCycles);
-    result.delay += cyclesToTicks(permCacheAccessCycles);
-
-    bool permitted = false;
-    if (hasCachedPermission(paddr, vmid, perm)) {
-        stats.permissionCacheHits++;
-        result.delay += permCacheHitLatency;
-        permitted = true;
-    } else {
-        stats.permissionCacheMisses++;
-        const Addr metadata_paddr = driver->metadataPaddrFor(paddr, vmid);
-        fatal_if(rid != 0 && metadata_paddr == 0,
-                 "%s could not locate DSM-TEE metadata for %#x VMID %u",
-                 name(), paddr, vmid);
-        stats.metadataReads++;
-        stats.metadataReadBytes += DsmTeeMemoryDriver::MetadataCacheLineBytes;
-        result.metadataMiss = true;
-        result.metadataPaddr = metadata_paddr;
-        if (resolve_metadata_miss) {
-            result.delay += metadataReadLatency;
-            result.delay += permCacheMissLatency;
-            permitted = driver->hasAccess(paddr, vmid, perm);
-            if (permitted)
-                insertPermissionCache(paddr, vmid, perm);
-        } else {
+    if (rid != 0 && include_tlb_miss && pkt->req &&
+        pkt->req->isTlbMiss()) {
+        const PermissionLookup tlb_lookup = checkPermission(
+            pkt, paddr, vmid, perm, resolve_metadata_miss,
+            MetadataReadKind::TlbMiss);
+        result.delay += tlb_lookup.delay;
+        if (tlb_lookup.metadataMiss) {
+            result.metadataMiss = true;
+            result.metadataPaddr = tlb_lookup.metadataPaddr;
+            result.metadataKind = MetadataReadKind::TlbMiss;
             result.permitted = true;
             return result;
         }
     }
 
-    result.permitted = permitted;
-    if (!permitted) {
-        stats.permissionDenied++;
-        handlePermissionDenied(pkt, vmid, perm);
-    } else {
-        if (perm & DsmTeeMemoryDriver::PermRead)
-            stats.readPermitted++;
-        if (perm & DsmTeeMemoryDriver::PermWrite)
-            stats.writePermitted++;
-        if (perm & DsmTeeMemoryDriver::PermExec)
-            stats.execPermitted++;
+    const PermissionLookup data_lookup = checkPermission(
+        pkt, paddr, vmid, perm, resolve_metadata_miss,
+        MetadataReadKind::DataPath);
+    result.delay += data_lookup.delay;
+    if (data_lookup.metadataMiss) {
+        result.metadataMiss = true;
+        result.metadataPaddr = data_lookup.metadataPaddr;
+        result.metadataKind = MetadataReadKind::DataPath;
+        result.permitted = true;
+        return result;
     }
 
+    result.permitted = data_lookup.permitted;
     return result;
 }
 
@@ -397,7 +478,8 @@ DsmTeeController::makeMetadataReadPacket(
     PacketPtr metadata_pkt = Packet::createRead(req);
     metadata_pkt->allocate();
     metadata_pkt->pushSenderState(new MetadataReadSenderState(
-            data_pkt, lookup.paddr, lookup.vmid, lookup.perm));
+            data_pkt, lookup.paddr, lookup.vmid, lookup.perm,
+            lookup.metadataKind));
     return metadata_pkt;
 }
 
@@ -431,6 +513,7 @@ DsmTeeController::finishMetadataRead(PacketPtr metadata_pkt,
     const Addr paddr = state->dataPaddr;
     const uint32_t vmid = state->vmid;
     const uint8_t perm = state->perm;
+    const MetadataReadKind kind = state->kind;
 
     bool permitted = driver->hasAccess(paddr, vmid, perm);
     if (permitted) {
@@ -441,18 +524,33 @@ DsmTeeController::finishMetadataRead(PacketPtr metadata_pkt,
     }
 
     if (permitted) {
-        if (perm & DsmTeeMemoryDriver::PermRead)
-            stats.readPermitted++;
-        if (perm & DsmTeeMemoryDriver::PermWrite)
-            stats.writePermitted++;
-        if (perm & DsmTeeMemoryDriver::PermExec)
-            stats.execPermitted++;
+        accountPermissionGranted(perm);
     }
 
     stats.totalReqDelay += permCacheMissLatency;
 
     delete metadata_pkt->popSenderState();
     delete metadata_pkt;
+
+    if (kind == MetadataReadKind::TlbMiss) {
+        const PermissionLookup data_lookup = checkPermission(
+            blocked_pkt, paddr, vmid, perm, false,
+            MetadataReadKind::DataPath);
+        const Tick delay = permCacheMissLatency + data_lookup.delay;
+        stats.totalReqDelay += data_lookup.delay;
+
+        if (data_lookup.metadataMiss) {
+            PacketPtr data_metadata_pkt =
+                makeMetadataReadPacket(blocked_pkt, data_lookup);
+            requestPort.schedTimingReq(
+                data_metadata_pkt, curTick() + receive_delay + delay);
+            return;
+        }
+
+        requestPort.schedTimingReq(blocked_pkt, curTick() + receive_delay +
+                                   delay);
+        return;
+    }
 
     requestPort.schedTimingReq(blocked_pkt, curTick() + receive_delay +
                                permCacheMissLatency);

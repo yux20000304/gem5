@@ -450,6 +450,7 @@ TLB::translate(const RequestPtr &req,
                         panic("Invalid mode\n");
                         break;
                 }
+                req->setFlags(Request::TLB_MISS);
                 if (FullSystem) {
                     Fault fault = walker->start(tc, translation, req, mode);
                     if (timing || fault != NoFault) {
